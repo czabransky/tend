@@ -287,6 +287,22 @@ class LaunchTest(TendTest):
         self.assertFalse(tend.supervised(old))
         self.assertEqual(tend.unsupervised(old), old)
 
+    def test_starting_an_old_job_upgrades_its_launcher(self):
+        add_job("web", "npm run dev")
+        job = tend.read_job("web")
+        job["ProgramArguments"] = ["/usr/bin/fish", "--login", "-c", "exec direnv exec $argv[1] /bin/sh -c $argv[2]",
+                                   "/work/app", "npm run dev"]
+        with open(tend.plist_path("web"), "wb") as f:
+            plistlib.dump(job, f)
+        with mock.patch.object(tend.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"PATH": "/terminal/bin:/usr/bin"}):
+            tend.upgrade("web")
+            expected = tend.launch_args("web", "/work/app", "npm run dev")
+        job = tend.read_job("web")
+        self.assertEqual(job["ProgramArguments"], expected)
+        self.assertEqual(job["EnvironmentVariables"]["PATH"], "/terminal/bin:/usr/bin")
+        self.assertEqual(job["Label"], "local.tend.web")
+
     def test_stop_marks_the_job_busy_so_its_exit_isnt_a_crash(self):
         add_job("web", "npm run dev")
         seen = []

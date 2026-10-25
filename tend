@@ -550,9 +550,28 @@ def unload_or_down(name, volumes):
     unload(name, COMPOSE_TIMEOUT)
 
 
+def upgrade(name):
+    """Give a job created before the supervisor the current launcher, keeping its directory and
+    command. Its old launcher was a login fish shell, which supplied PATH, so the job takes the
+    PATH of the terminal starting it now."""
+    job = read_job(name)
+    if supervised(job["ProgramArguments"]):
+        return job
+    job["ProgramArguments"] = launch_args(name, job["WorkingDirectory"], job["ProgramArguments"][-1])
+    env = job.setdefault("EnvironmentVariables", {})
+    for key in SAVED_ENV:
+        if key in os.environ:
+            env.setdefault(key, os.environ[key])
+    for key, value in COLOR_ENV.items():
+        env.setdefault(key, value)
+    with open(plist_path(name), "wb") as f:
+        plistlib.dump(job, f)
+    return job
+
+
 def load(name, banner, mode):
     """Write a header line to the log (truncating it with mode "w"), then bootstrap the job."""
-    job = read_job(name)
+    job = upgrade(name)
     LOGS.mkdir(parents=True, exist_ok=True)
     trim_log(name)
     warnings = port_conflicts(name)
