@@ -37,6 +37,7 @@
           installPhase = ''
             runHook preInstall
             install -Dm755 tend $out/bin/tend
+            install -Dm644 completions/tend.fish $out/share/fish/vendor_completions.d/tend.fish
             wrapProgram $out/bin/tend --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.fzf ]}
             runHook postInstall
           '';

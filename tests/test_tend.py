@@ -10,6 +10,7 @@ import io
 import os
 import plistlib
 import tempfile
+import time
 import types
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -96,7 +97,7 @@ class ComposeParsingTest(TendTest):
         }
         self.job_status.return_value = (42, None)
         with mock.patch.object(tend, "compose_containers", return_value=containers), mock.patch.object(
-            tend, "uptime", return_value="00:01"
+            tend, "started", return_value=None
         ):
             ports = {job["name"]: job["ports"] for job in tend.jobs()}
         self.assertEqual(ports, {"infra": [5432], "root": [8080]})
@@ -238,14 +239,14 @@ class UrlTest(TendTest):
 class TableTest(TendTest):
     def test_fzf_rows_hide_nothing_and_put_the_directory_last(self):
         job = {
-            "name": "pf-api", "state": "running", "uptime": "00:04", "exit_code": None, "ports": [5126],
+            "name": "pf-api", "state": "running", "since": "14:02", "exit_code": None, "ports": [5126],
             "dir": "/work/api", "command": "dotnet run", "busy": None,
         }
         busy = {**job, "name": "pf-db", "busy": "stopping", "ports": []}
         with mock.patch.object(tend, "jobs", return_value=[job, busy]):
             header, api, db = (line.split("\t") for line in tend.table(fzf=True))
         self.assertEqual([cell.strip() for cell in header], ["", "NAME", "STATUS", "PORTS", "COMMAND", "DIR"])
-        self.assertEqual([cell.strip() for cell in api], ["●", "pf-api", "up 00:04", "5126", "dotnet run", "/work/api"])
+        self.assertEqual([cell.strip() for cell in api], ["●", "pf-api", "up since 14:02", "5126", "dotnet run", "/work/api"])
         self.assertEqual([cell.strip() for cell in db][:3], ["◐", "pf-db", "stopping…"])
 
 
@@ -266,17 +267,52 @@ class ThemeTest(TendTest):
 
 
 class LaunchTest(TendTest):
+    def supervisor(self, name):
+        return ["/bin/sh", "-c", tend.SUPERVISE, name, str(tend.busy_path(name))]
+
     def test_direnv_when_installed(self):
         with mock.patch.object(tend.shutil, "which", return_value="/bin/direnv"):
-            args = tend.launch_args(Path("/work/app"), "npm run dev")
-        self.assertEqual(args, ["/bin/sh", "-c", tend.DIRENV_LAUNCH, "/bin/direnv", "/work/app", "npm run dev"])
+            args = tend.launch_args("web", Path("/work/app"), "npm run dev")
+        launcher = ["/bin/sh", "-c", tend.DIRENV_LAUNCH, "/bin/direnv", "/work/app", "npm run dev"]
+        self.assertEqual(args, self.supervisor("web") + launcher)
+        self.assertEqual(tend.unsupervised(args), launcher)
 
     def test_plain_sh_without_direnv(self):
         with mock.patch.object(tend.shutil, "which", return_value=None):
-            self.assertEqual(tend.launch_args(Path("/work/app"), "npm run dev"), ["/bin/sh", "-c", "npm run dev"])
+            args = tend.launch_args("web", Path("/work/app"), "npm run dev")
+        self.assertEqual(args, self.supervisor("web") + ["/bin/sh", "-c", "npm run dev"])
+
+    def test_jobs_from_before_the_supervisor(self):
+        old = ["/usr/bin/fish", "--login", "-c", "exec direnv exec $argv[1] /bin/sh -c $argv[2]", "/w", "npm run dev"]
+        self.assertFalse(tend.supervised(old))
+        self.assertEqual(tend.unsupervised(old), old)
+
+    def test_stop_marks_the_job_busy_so_its_exit_isnt_a_crash(self):
+        add_job("web", "npm run dev")
+        seen = []
+        with mock.patch.object(tend, "unload", side_effect=lambda name, timeout=10: seen.append(tend.busy_path(name).read_text())):
+            tend.stop_job("web")
+        self.assertEqual(seen, ["stopping"])
+        self.assertFalse(tend.busy_path("web").exists())
+
+    def test_keep_alive_and_saved_env_in_the_plist(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(tend.Path, "cwd", return_value=Path(tmp)), \
+                mock.patch.object(tend, "load", return_value="started"), mock.patch.object(tend, "unload"), \
+                mock.patch.dict(os.environ, {"PATH": "/custom/bin:/usr/bin"}), contextlib.redirect_stdout(io.StringIO()):
+            tend.cmd_run(types.SimpleNamespace(command=["npm run dev"], name="web", keep_alive=True))
+        job = tend.read_job("web")
+        self.assertEqual(job["KeepAlive"], {"SuccessfulExit": False})
+        self.assertEqual(job["EnvironmentVariables"]["PATH"], "/custom/bin:/usr/bin")
+        self.assertTrue(tend.supervised(job["ProgramArguments"]))
 
     def test_compose_stop_runs_down_through_the_job_launcher(self):
+        with mock.patch.object(tend.shutil, "which", return_value=None):
+            arguments = tend.launch_args("db", Path("/work/app"), "docker compose -p x up")
         add_job("db", "docker compose -p x up")
+        job = tend.read_job("db")
+        job["ProgramArguments"] = arguments
+        with open(tend.plist_path("db"), "wb") as f:
+            plistlib.dump(job, f)
         with mock.patch.object(tend.subprocess, "run") as run, mock.patch.object(tend, "unload") as unload:
             run.return_value.returncode = 0
             tend.stop_job("db", volumes=True)
@@ -292,14 +328,22 @@ class LaunchTest(TendTest):
 class RenameTest(TendTest):
     def test_moves_plist_and_log(self):
         add_job("old", "npm run dev")
+        job = tend.read_job("old")
+        with mock.patch.object(tend.shutil, "which", return_value=None):
+            job["ProgramArguments"] = tend.launch_args("old", Path("/work/app"), "npm run dev")
+        with open(tend.plist_path("old"), "wb") as f:
+            plistlib.dump(job, f)
+        tend.ports_path("old").write_text("[5173]")
         write_log("old", "hello\n")
         with mock.patch.object(tend, "unload"):
             tend.rename("old", "new")
         job = tend.read_job("new")
         self.assertEqual(job["Label"], "local.tend.new")
+        self.assertEqual(job["ProgramArguments"][3:5], ["new", str(tend.busy_path("new"))])
         self.assertEqual(job["StandardOutPath"], str(tend.log_path("new")))
         self.assertEqual(tend.log_path("new").read_text(), "hello\n")
         self.assertFalse(tend.plist_path("old").exists())
+        self.assertEqual(tend.ports_path("new").read_text(), "[5173]")
 
     def test_rejects_taken_and_invalid_names(self):
         add_job("old", "npm run dev")
@@ -337,6 +381,68 @@ class FzfKeyTest(TendTest):
             done = self.key("enter", "other", prompt, "site")
         self.assertEqual(background.call_args.args[:2], (["web"], "renaming"))
         self.assertTrue(done.endswith(f"reload({tend.SELF} ls --fzf)"))
+
+
+class LogTrimTest(TendTest):
+    def test_cuts_a_long_log_to_whole_lines_at_its_end(self):
+        lines = [f"line {i:06d}\n" for i in range(5000)]
+        write_log("web", "".join(lines))
+        with mock.patch.object(tend, "LOG_LIMIT", 20_000), mock.patch.object(tend, "LOG_KEEP", 5_000):
+            tend.trim_log("web")
+        kept = tend.log_path("web").read_text().splitlines(keepends=True)
+        self.assertLessEqual(len("".join(kept)), 5_000)
+        self.assertEqual(kept, lines[-len(kept):])
+
+    def test_leaves_a_short_log_alone(self):
+        write_log("web", "short\n")
+        tend.trim_log("web")
+        self.assertEqual(tend.log_path("web").read_text(), "short\n")
+
+
+class PortConflictTest(TendTest):
+    def test_names_the_process_holding_a_remembered_port(self):
+        add_job("web", "npm run dev")
+        tend.remember_ports("web", [5173, 5174])
+        held = {5173: [("node", 4242)], 5174: []}
+        with mock.patch.object(tend, "holders", side_effect=lambda port: held[port]):
+            self.assertEqual(tend.port_conflicts("web"), ["web: port 5173 is in use by node (pid 4242)"])
+
+    def test_no_remembered_ports(self):
+        self.assertEqual(tend.port_conflicts("web"), [])
+
+
+class SinceTest(TendTest):
+    def test_today_is_a_time_and_earlier_is_a_date(self):
+        now = time.time()
+        self.assertEqual(tend.since(now), time.strftime("%H:%M", time.localtime(now)))
+        self.assertRegex(tend.since(now - 3 * 86400), r"^[A-Z][a-z]{2} \d{1,2}$")
+
+
+class RefreshTest(TendTest):
+    def refresh(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            tend.cmd_fzf_key(types.SimpleNamespace(key="refresh", name=""))
+        return out.getvalue().strip()
+
+    def test_reloads_only_when_rows_change(self):
+        add_job("web", "npm run dev")
+        with mock.patch.dict(os.environ, {"FZF_PORT": "test-refresh"}):
+            tend.rows_cache().unlink(missing_ok=True)
+            self.assertTrue(self.refresh().startswith("reload(cat "))
+            self.assertEqual(self.refresh(), "")
+            add_job("api", "dotnet run")
+            self.assertTrue(self.refresh().startswith("reload(cat "))
+            tend.rows_cache().unlink()
+
+
+class CompleteTest(TendTest):
+    def test_jobs_with_descriptions(self):
+        add_job("web", "npm run dev")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            tend.cmd_complete(types.SimpleNamespace(what="jobs"))
+        self.assertEqual(out.getvalue(), "web\tstopped: npm run dev\n")
 
 
 if __name__ == "__main__":

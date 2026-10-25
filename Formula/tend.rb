@@ -11,6 +11,7 @@ class Tend < Formula
     # Homebrew requires the Command Line Tools, which provide /usr/bin/python3.
     inreplace "tend", "#!/usr/bin/env python3", "#!/usr/bin/python3"
     bin.install "tend"
+    fish_completion.install "completions/tend.fish"
   end
 
   test do

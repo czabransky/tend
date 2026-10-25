@@ -28,6 +28,7 @@ Or copy `tend` onto your PATH: it's one Python file using only the standard libr
 
 ```fish
 tend run -- pnpm dev            # job named after the current directory; -n picks a name
+tend run --keep-alive -- pnpm dev   # start it again whenever it crashes
 tend run                        # pick a package.json script, .csproj or compose file in fzf
 tend run -- docker compose up
 tend                            # manage jobs in fzf with a live log preview
@@ -40,10 +41,14 @@ tend restart 'pf*'              # patterns; quote them so the shell doesn't expa
 ```
 
 Commands that take a name use the current directory's job without one, or open an fzf picker.
+The fish completions complete job names, and for `tend run`, the directory's scripts, projects
+and compose files.
 
 ## Job manager
 
 `tend` with no arguments opens the job list in fzf, with the focused job's log on the right.
+The list refreshes every 2 seconds, and only reloads when a row changed, because a reload
+restarts the log preview.
 
 | Key | Action |
 | --- | --- |
@@ -62,7 +67,13 @@ with the label `local.tend.<name>`. It runs the command with `/bin/sh` in the di
 you ran `tend run`, with that terminal's PATH and locale. When direnv is installed, the command
 runs through `direnv exec`, so the directory's `.envrc` applies. Restarts keep the saved PATH;
 run `tend run` again to pick up a changed one. Output goes to `~/Library/Logs/tend/<name>.log`.
-Nothing starts at login, and a crashed job stays down.
+Nothing starts at login. A crashed job stays down unless it was started with `--keep-alive`,
+and either way it raises a macOS notification. A small `sh` supervisor in front of the command
+does that: it passes launchd's `SIGTERM` on to the command, keeps the command's exit code, and
+stays quiet when tend itself is stopping the job.
+
+Logs are cut to their last 2 MB once they pass 10 MB. Before a start, tend warns when a port the
+job listened on last time is held by another process, and names it.
 
 Stopping a job unloads it from launchd, which sends `SIGTERM` and then kills what's left of its
 process group, including the `node` or app process a wrapper like `npm` or `dotnet run` started.
