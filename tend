@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""Run dev commands (npm run dev, dotnet run, ...) in the background as launchd jobs.
+
+Usage: tend                                  manage jobs in fzf, with a live log preview
+       tend run [-n name] [-- command...]    no command: pick a script, .csproj or compose file
+       tend ls [--json]
+       tend logs [-f] [-l lines] [name]
+       tend open [name]                      open the URL the job logged, or localhost:<port>
+       tend stop [-v] [name...]              compose jobs: down, and -v removes volumes
+       tend restart|rm [name...]
+       tend rename name [new]                prompts for the new name; a running job restarts
+
+A job runs its command with /bin/sh in the directory `tend run` was called from, with the PATH
+and locale of the terminal that ran `tend run`, and through `direnv exec` when direnv is
+installed, so the directory's .envrc applies. Restarts keep that PATH; `tend run` again picks up
+a changed one. A job keeps running after the terminal closes, and nothing starts at login. A job is named after its directory
+unless -n is given. Commands that take a name use the current directory's job without one, or
+open an fzf picker when there isn't one. One argument after `run` goes to the shell as written
+(`tend run 'pnpm db:up && pnpm dev'`); several are quoted and joined. Names can be patterns
+(`tend restart 'pf*'`; quoted, so the shell doesn't expand them against files).
+
+Each job is a plist in ~/.local/state/tend/: `stop` keeps it for a later `restart`, `rm` deletes
+it. Logs go to ~/Library/Logs/tend/<name>.log. `tend ls --json` is the interface for other tools.
+
+A plain `docker compose ... up` command (no shell operators) is a compose job: `stop` runs
+`docker compose ... down` with the same global flags, so `restart` is down then up, and launchd
+gives compose 120 seconds to stop its containers. Its ports come from `docker ps`, because
+Docker's port forwarder (colima, Docker Desktop) holds them rather than the job.
+
+Acting on several jobs, `stop` and `rm` take the other jobs first and compose jobs last.
+`restart` stops the whole group that way, then starts compose jobs first and waits until their
+containers are up (and healthy, where they have a healthcheck) before starting the rest.
+
+Colors: TEND_THEME=frappe (the default, Catppuccin Frappé) or TEND_THEME=terminal, which uses
+the terminal's own 16 colors and leaves fzf's colors to FZF_DEFAULT_OPTS. TEND_FZF_COLORS is
+passed to fzf as one more --color, after the theme's, to change parts of it. NO_COLOR turns
+colors off in `tend ls`.
+"""
+
+import argparse
+import fnmatch
+import json
+import os
+import plistlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.1.0"
+JOBS = Path.home() / ".local" / "state" / "tend"
+LOGS = Path.home() / "Library" / "Logs" / "tend"
+GUI = f"gui/{os.getuid()}"
+# sh -c passes the arguments after the script as $0, $1, ...
+DIRENV_LAUNCH = 'exec "$0" exec "$1" /bin/sh -c "$2"'
+# Copied from the terminal that runs `tend run`; launchd's own PATH is only the system one.
+SAVED_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE")
+NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+# Dev tools drop colors when their output isn't a terminal; these keep them in the log.
+COLOR_ENV = {"FORCE_COLOR": "1", "DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION": "1", "COMPOSE_ANSI": "always"}
+COMPOSE_FILES = ["compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml"]
+# Seconds launchd and tend give `docker compose` to stop its containers before killing it.
+COMPOSE_TIMEOUT = 120
+# Seconds a group start waits for a compose job's containers before giving up on the rest.
+COMPOSE_READY_TIMEOUT = 300
+PUBLISHED_RE = re.compile(r":(\d+)->")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+URL_RE = re.compile(
+    r"(?P<scheme>https?)://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):(?P<port>\d+)(?P<path>/[^\s'\"<>]*)?"
+)
+LOCKFILES = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun"), ("bun.lockb", "bun")]
+SKIP_DIRS = {".git", "node_modules", "bin", "obj"}
+SELF = shlex.quote(os.path.abspath(sys.argv[0]))
+PROMPT = "❯ "
+THEMES = ("frappe", "terminal")
+# Catppuccin Frappé, the default theme.
+PALETTE = {
+    "text": "c6d0f5", "subtext": "a5adce", "dim": "737994", "surface": "414559", "border": "51576d",
+    "green": "a6d189", "red": "e78284", "blue": "8caaee", "teal": "81c8be", "mauve": "ca9ee6",
+    "yellow": "e5c890",
+}
+# TEND_THEME=terminal: the terminal's 16 colors, as SGR codes.
+ANSI_COLORS = {
+    "text": "39", "subtext": "39", "dim": "90", "surface": "100", "border": "90",
+    "green": "32", "red": "31", "blue": "34", "teal": "36", "mauve": "35", "yellow": "33",
+}
+STATE_COLORS = {"running": "green", "exited": "red", "stopped": "dim", "busy": "yellow"}
+COLUMN_COLORS = {"name": "text", "ports": "teal", "dir": "dim"}
+FZF_COLORS = ",".join(
+    f"{part}:#{PALETTE[color]}"
+    for part, color in [
+        ("fg", "subtext"), ("fg+", "text"), ("bg+", "surface"), ("hl", "red"), ("hl+", "red"),
+        ("pointer", "mauve"), ("prompt", "mauve"), ("info", "dim"), ("border", "border"),
+        ("label", "blue"), ("header", "dim"), ("footer", "subtext"), ("ghost", "dim"),
+    ]
+)
+
+
+class TendError(Exception):
+    pass
+
+
+def label(name):
+    return f"local.tend.{name}"
+
+
+def plist_path(name):
+    return JOBS / f"{name}.plist"
+
+
+def busy_path(name):
+    """Holds "stopping", "restarting", "removing" or "renaming" while the fzf manager's action runs."""
+    return JOBS / f"{name}.busy"
+
+
+def log_path(name):
+    return LOGS / f"{name}.log"
+
+
+def launchctl(*args):
+    out = subprocess.run(["launchctl", *args], capture_output=True, text=True)
+    if out.returncode != 0:
+        raise TendError(f"launchctl {args[0]} failed: {(out.stderr or out.stdout).strip()}")
+
+
+def dir_name():
+    name = re.sub(r"[^a-z0-9-]+", "-", Path.cwd().name.lower()).strip("-")[:63].strip("-")
+    return name if NAME_RE.match(name) else None
+
+
+def check_name(name):
+    if not NAME_RE.match(name):
+        raise TendError(f"{name!r}: names are lowercase letters, digits, and hyphens")
+    if not plist_path(name).exists():
+        raise TendError(f"{name}: no such job, see tend ls")
+    return name
+
+
+def names(given):
+    """The named jobs (or those matching a pattern), else the current directory's job, else one
+    picked in fzf."""
+    if given:
+        found = []
+        for pattern in given:
+            if any(c in pattern for c in "*?["):
+                matches = sorted(p.stem for p in JOBS.glob("*.plist") if fnmatch.fnmatchcase(p.stem, pattern))
+                if not matches:
+                    raise TendError(f"{pattern}: no jobs match, see tend ls")
+            else:
+                matches = [check_name(pattern)]
+            found += [m for m in matches if m not in found]
+        return found
+    name = dir_name()
+    if name and plist_path(name).exists():
+        return [name]
+    if picked := pick():
+        return [picked]
+    raise TendError("no job for this directory; pass a name, see tend ls")
+
+
+def job_status(name):
+    """(pid, last exit code). pid is None if the job isn't loaded and 0 if it isn't running."""
+    out = subprocess.run(["launchctl", "print", f"{GUI}/{label(name)}"], capture_output=True, text=True)
+    if out.returncode != 0:
+        return None, None
+    pid, code = 0, None
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("pid = "):
+            pid = int(line.split(" = ")[1])
+        elif line.startswith("last exit code = "):
+            value = line.split(" = ")[1]
+            code = int(value) if value.lstrip("-").isdigit() else None
+    return pid, code
+
+
+def ports(pid):
+    """TCP ports the job's process group listens on. launchd makes each job a group leader."""
+    out = subprocess.run(
+        ["lsof", "-nP", "-a", "-g", str(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"], capture_output=True, text=True
+    )
+    return sorted({int(line.rsplit(":", 1)[1]) for line in out.stdout.splitlines() if line.startswith("n")})
+
+
+def compose_prefix(command):
+    """The tokens before `up` in a plain `docker compose ... up ...` command, else None."""
+    if re.search(r"[;&|]", command):
+        return None
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
+    start = 2 if tokens[:2] == ["docker", "compose"] else 1 if tokens[:1] == ["docker-compose"] else None
+    if start is None or "up" not in tokens[start:]:
+        return None
+    return tokens[: tokens.index("up", start)]
+
+
+def project_dir(directory, prefix):
+    """The compose project directory: --project-directory, else the first -f file's directory."""
+    project, files = None, []
+    for i, token in enumerate(prefix):
+        value = prefix[i + 1] if i + 1 < len(prefix) else ""
+        if token in ("-f", "--file"):
+            files.append(value)
+        elif token.startswith("--file="):
+            files.append(token.split("=", 1)[1])
+        elif token == "--project-directory":
+            project = value
+        elif token.startswith("--project-directory="):
+            project = token.split("=", 1)[1]
+    base = project or (os.path.dirname(files[0]) if files else "")
+    return os.path.normpath(os.path.join(directory, base))
+
+
+def compose_containers():
+    """{project directory: [(status, ports)]} for running compose containers."""
+    template = '{{.Label "com.docker.compose.project.working_dir"}}\t{{.Status}}\t{{.Ports}}'
+    try:
+        out = subprocess.run(["docker", "ps", "--format", template], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    found = {}
+    for line in out.stdout.splitlines():
+        directory, status, published = (line.split("\t") + ["", ""])[:3]
+        if directory:
+            found.setdefault(os.path.normpath(directory), []).append((status, published))
+    return found
+
+
+def compose_ports():
+    """{project directory: published ports} for running compose containers."""
+    return {
+        directory: {int(p) for _, published in containers for p in PUBLISHED_RE.findall(published)}
+        for directory, containers in compose_containers().items()
+    }
+
+
+def uptime(pid):
+    return subprocess.run(["ps", "-o", "etime=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+
+
+def read_job(name):
+    with open(plist_path(name), "rb") as f:
+        return plistlib.load(f)
+
+
+def jobs(only=None):
+    published = None
+    for path in sorted(JOBS.glob("*.plist")):
+        if only and path.stem != only:
+            continue
+        job = read_job(path.stem)
+        command = job["ProgramArguments"][-1]
+        prefix = compose_prefix(command)
+        compose = prefix is not None
+        pid, code = job_status(path.stem)
+        running = bool(pid)
+        listening = []
+        if running and compose:
+            # Docker's port forwarder holds the sockets, so ask docker.
+            published = compose_ports() if published is None else published
+            listening = sorted(published.get(project_dir(job["WorkingDirectory"], prefix), ()))
+        elif running:
+            listening = ports(pid)
+        yield {
+            "name": path.stem,
+            "kind": "compose" if compose else "command",
+            "state": "running" if running else "stopped" if pid is None else "exited",
+            "pid": pid if running else None,
+            "exit_code": code,
+            "uptime": uptime(pid) if running else None,
+            "ports": listening,
+            "dir": job["WorkingDirectory"],
+            "command": command,
+            "log": str(log_path(path.stem)),
+            "busy": busy_path(path.stem).read_text() if busy_path(path.stem).exists() else None,
+        }
+
+
+def theme():
+    return os.environ.get("TEND_THEME", "frappe")
+
+
+def paint(text, color, bold=False):
+    if theme() == "terminal":
+        code = ANSI_COLORS[color]
+    else:
+        r, g, b = (int(PALETTE[color][i : i + 2], 16) for i in (0, 2, 4))
+        code = f"38;2;{r};{g};{b}"
+    return f"\x1b[{'1;' if bold else ''}{code}m{text}\x1b[0m"
+
+
+def table(color=False, fzf=False):
+    """Aligned rows under a header row. fzf rows are tab-separated with the directory last, which
+    the fzf views hide from the list and show in the preview label."""
+    header = {"state": "", "name": "NAME", "status": "STATUS", "ports": "PORTS", "dir": "DIR", "command": "COMMAND"}
+    rows = [header]
+    for job in jobs():
+        status = {"running": f"up {job['uptime']}", "exited": f"exited {job['exit_code']}"}.get(job["state"], "stopped")
+        rows.append(
+            {
+                "state": "busy" if job["busy"] else job["state"],
+                "name": job["name"],
+                "status": f"{job['busy']}…" if job["busy"] else status,
+                "ports": ",".join(map(str, job["ports"])) or "-",
+                "dir": job["dir"].replace(str(Path.home()), "~", 1),
+                "command": job["command"],
+            }
+        )
+    columns = ["state", "name", "status", "ports", *(["command", "dir"] if fzf else ["dir", "command"])]
+    widths = {c: max(1 if c == "state" else len(row[c]) for row in rows) for c in columns[:-1]}
+    lines = []
+    for row in rows:
+        cells = []
+        for c in columns:
+            text = (" " if row is header else "◐" if row[c] == "busy" else "●") if c == "state" else row[c]
+            # fzf shows each tab as one space (--tabstop 1); the extra pad keeps a two-space gap.
+            text = text.ljust(widths[c] + fzf) if c in widths else text
+            if color and row is header:
+                text = paint(text, "dim")
+            elif color and c in ("state", "status"):
+                text = paint(text, STATE_COLORS[row["state"]])
+            elif color and c in COLUMN_COLORS:
+                text = paint(text, COLUMN_COLORS[c], bold=c == "name")
+            cells.append(text)
+        lines.append(("\t" if fzf else "  ").join(cells))
+    return lines
+
+
+def interactive():
+    return sys.stdin.isatty() and sys.stdout.isatty() and shutil.which("fzf")
+
+
+def style():
+    """fzf options shared by every tend view: the theme's colors, panel borders, a bar pointer."""
+    colors = [] if theme() == "terminal" else ["--color", FZF_COLORS]
+    if os.environ.get("TEND_FZF_COLORS"):
+        colors += ["--color", os.environ["TEND_FZF_COLORS"]]
+    return [
+        "--ansi",
+        "--layout", "reverse",
+        "--style", "full",
+        *colors,
+        "--pointer", "▌",
+        "--prompt", PROMPT,
+        "--info", "inline-right",
+        "--with-shell", "/bin/sh -c",
+    ]
+
+
+def job_view():
+    """fzf options for a list of `tend ls --fzf` rows with a log preview of the focused job."""
+    return [
+        "--header-lines", "1",
+        "--delimiter", "\t",
+        "--with-nth", "1..5",
+        "--tabstop", "1",
+        "--id-nth", "2",
+        "--track",
+        "--ghost", "filter jobs",
+        "--list-label", " jobs ",
+        "--preview-window", "right,62%,follow,wrap,<150(down,65%,follow,wrap)",
+        "--bind", "focus:transform-preview-label:printf ' %s  %s ' {2} {6}",
+    ]
+
+
+def fzf(lines, *options):
+    out = subprocess.run(["fzf", *style(), *options], input="\n".join(lines), stdout=subprocess.PIPE, text=True)
+    return out.stdout.rstrip("\n") if out.returncode == 0 else None
+
+
+def pick():
+    if not interactive() or not any(JOBS.glob("*.plist")):
+        return None
+    line = fzf(table(color=True, fzf=True), *job_view(), "--preview", f"{SELF} logs -l 200 {{2}}")
+    return line.split("\t")[1].strip() if line else None
+
+
+def unload(name, timeout=10):
+    if job_status(name)[0] is None:
+        return
+    launchctl("bootout", f"{GUI}/{label(name)}")
+    for _ in range(timeout * 5):
+        if job_status(name)[0] is None:
+            return
+        time.sleep(0.2)
+    raise TendError(f"{name}: launchd didn't unload the job within {timeout} seconds")
+
+
+def stop_job(name, volumes=False):
+    """Unload the job. A compose job runs `down` (with -v if `volumes`) first, which also removes
+    containers left over from a run that was killed."""
+    job = read_job(name)
+    prefix = compose_prefix(job["ProgramArguments"][-1])
+    if volumes and prefix is None:
+        raise TendError(f"{name}: -v only applies to docker compose jobs")
+    if prefix is None:
+        return unload(name)
+    down = shlex.join([*prefix, "down", *(["-v"] if volumes else [])])
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(log_path(name), "a") as log:
+        log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} tend: stopping: {down}\n")
+        log.flush()
+        try:
+            # The job's own launcher, with `down` in place of the command.
+            failed = subprocess.run(
+                [*job["ProgramArguments"][:-1], down],
+                cwd=job["WorkingDirectory"],
+                env={**os.environ, **job.get("EnvironmentVariables", {})},
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=COMPOSE_TIMEOUT,
+            ).returncode != 0
+        except subprocess.TimeoutExpired:
+            failed = True
+    if failed:
+        raise TendError(f"{name}: {down} failed, see tend logs {name}")
+    unload(name, COMPOSE_TIMEOUT)
+
+
+def load(name, banner, mode):
+    """Write a header line to the log (truncating it with mode "w"), then bootstrap the job."""
+    job = read_job(name)
+    LOGS.mkdir(parents=True, exist_ok=True)
+    with open(log_path(name), mode) as log:
+        log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} tend: {banner}: {job['ProgramArguments'][-1]}\n")
+    launchctl("bootstrap", GUI, str(plist_path(name)))
+    time.sleep(1)
+    pid, code = job_status(name)
+    if pid:
+        return f"{name}: {banner}, pid {pid}, see tend logs {name}"
+    raise TendError(f"{name}: exited right after starting (exit code {code}), see tend logs {name}")
+
+
+def candidates(directory):
+    """(command, detail) for each package.json script, and each .csproj and compose file up to
+    three levels down."""
+    found = []
+    package = directory / "package.json"
+    if package.exists():
+        runner = next((r for lockfile, r in LOCKFILES if (directory / lockfile).exists()), "npm")
+        with open(package) as f:
+            scripts = json.load(f).get("scripts", {})
+        found += [(f"{runner} run {name}", body) for name, body in scripts.items()]
+    for root, dirs, files in os.walk(directory):
+        depth = len(Path(root).relative_to(directory).parts)
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS) if depth < 3 else []
+        compose = next((f for f in COMPOSE_FILES if f in files), None)
+        if compose and depth == 0:
+            found.append(("docker compose up", compose))
+        elif compose:
+            path = Path(root, compose).relative_to(directory)
+            found.append((f"docker compose -f {shlex.quote(str(path))} up", ""))
+        for file in sorted(files):
+            if file.endswith(".csproj"):
+                project = Path(root, file).relative_to(directory)
+                found.append((f"dotnet run --project {shlex.quote(str(project))}", ""))
+    return found
+
+
+def choose_command(directory):
+    found = candidates(directory)
+    if not found or not interactive():
+        raise TendError("nothing to run: tend run [-n name] -- command...")
+    width = max(len(command) for command, _ in found)
+    lines = [f"{i}\t{command.ljust(width)}  {detail}" for i, (command, detail) in enumerate(found)]
+    line = fzf(lines, "--delimiter", "\t", "--with-nth", "2", "--prompt", "run> ")
+    if not line:
+        sys.exit(130)
+    return found[int(line.split("\t")[0])][0]
+
+
+def launch_args(directory, command):
+    """The job's ProgramArguments, with the command last."""
+    direnv = shutil.which("direnv")
+    if direnv:
+        return ["/bin/sh", "-c", DIRENV_LAUNCH, direnv, str(directory), command]
+    return ["/bin/sh", "-c", command]
+
+
+def cmd_run(args):
+    directory = Path.cwd()
+    if args.command:
+        command = args.command[0] if len(args.command) == 1 else shlex.join(args.command)
+    else:
+        command = choose_command(directory)
+    name = args.name or dir_name()
+    if not name or not NAME_RE.match(name):
+        raise TendError(f"can't use {name or directory.name!r} as a job name, pass -n with lowercase letters, digits, and hyphens")
+    if job_status(name)[0]:
+        raise TendError(f"{name}: already running; tend restart {name}, or pick another name with -n")
+    compose = compose_prefix(command) is not None
+    unload(name, COMPOSE_TIMEOUT if compose else 10)
+    JOBS.mkdir(parents=True, exist_ok=True)
+    with open(plist_path(name), "wb") as f:
+        plistlib.dump(
+            {
+                "Label": label(name),
+                "ProgramArguments": launch_args(directory, command),
+                "WorkingDirectory": str(directory),
+                "EnvironmentVariables": {
+                    **{key: os.environ[key] for key in SAVED_ENV if key in os.environ},
+                    **COLOR_ENV,
+                },
+                "StandardOutPath": str(log_path(name)),
+                "StandardErrorPath": str(log_path(name)),
+                "RunAtLoad": True,
+                **({"ExitTimeOut": COMPOSE_TIMEOUT} if compose else {}),
+            },
+            f,
+        )
+    print(load(name, "started", "w"))
+
+
+def cmd_ls(args):
+    color = args.fzf or (sys.stdout.isatty() and "NO_COLOR" not in os.environ)
+    if args.json:
+        print(json.dumps({"jobs": list(jobs())}))
+    elif not any(JOBS.glob("*.plist")):
+        message = "no jobs; start one with tend run"
+        print(paint(message, "dim") if color else message)
+    else:
+        print("\n".join(table(color=color, fzf=args.fzf)))
+
+
+def keys(*pairs):
+    return "   ".join(f"{paint(key, 'blue')} {action}" for key, action in pairs)
+
+
+def cmd_manage(args):
+    if not interactive():
+        return cmd_ls(argparse.Namespace(json=False, fzf=False))
+    reload = f"reload({SELF} ls --fzf)"
+    footer = "\n".join(
+        [
+            keys(("enter", "follow log"), ("ctrl-o", "open url"), ("ctrl-e", "rename")),
+            keys(("ctrl-s", "stop"), ("ctrl-r", "restart"), ("ctrl-x", "remove"), ("tab", "mark"), ("ctrl-a", "mark all")),
+            keys(("↑↓", "move"), ("type", "filter"), ("shift-↑↓", "scroll log"), ("esc", "quit")),
+        ]
+    )
+    os.execvp(
+        "fzf",
+        [
+            "fzf",
+            *style(),
+            *job_view(),
+            "--input-label", " tend ",
+            "--listen",
+            "--multi",
+            "--marker", "✓",
+            "--footer", footer,
+            "--preview", f"{SELF} logs -f -l 200 {{2}}",
+            "--bind", f"start:{reload}",
+            "--bind", f"enter:transform:{SELF} _fzf enter {{2}}",
+            "--bind", f"esc:transform:{SELF} _fzf esc",
+            # {+2} is every marked job, or the focused one when none are marked.
+            "--bind", f"ctrl-s:execute-silent({SELF} stop --fzf {{+2}})+clear-selection+{reload}",
+            "--bind", f"ctrl-r:execute-silent({SELF} restart --fzf {{+2}})+clear-selection+{reload}",
+            "--bind", f"ctrl-x:execute-silent({SELF} rm --fzf {{+2}})+clear-selection+{reload}",
+            "--bind", "ctrl-a:toggle-all",
+            "--bind", f"ctrl-o:execute-silent({SELF} open {{2}})",
+            "--bind", f"ctrl-e:transform:{SELF} _fzf ctrl-e {{2}}",
+        ],
+    )
+
+
+RENAME_RE = re.compile(r"^rename (\S+) ❯ $")
+# Leaves rename mode: search back on, the normal prompt, query and list label.
+NORMAL_MODE = f"enable-search+change-prompt({PROMPT})+change-query()+change-list-label( jobs )"
+
+
+def cmd_fzf_key(args):
+    """Print the fzf actions for enter, esc or ctrl-e in the manager. Rename mode is the prompt
+    "rename <name> ❯ " with search off, so the query holds the new name while the list stays put."""
+    renaming = RENAME_RE.match(os.environ.get("FZF_PROMPT", ""))
+    if args.key == "ctrl-e":
+        note = ", restarts it" if job_status(args.name)[0] else ""
+        print(
+            f"disable-search+change-prompt(rename {args.name} {PROMPT})+change-query({args.name})"
+            f"+change-list-label( enter: rename{note}   esc: cancel )"
+        )
+    elif args.key == "esc":
+        print(NORMAL_MODE if renaming else "abort")
+    elif not renaming:
+        print(f"become({SELF} logs -f {args.name})")
+    else:
+        old, new = renaming[1], os.environ.get("FZF_QUERY", "").strip()
+        if not new or new == old:
+            print(NORMAL_MODE)
+            return
+        try:
+            check_new_name(new)
+        except TendError as e:
+            # Parentheses would end the action's argument early.
+            message = re.sub(r"[()]", "", str(e))
+            print(f"change-list-label( {paint(message, 'red')} )")
+            return
+        in_background([old], "renaming", lambda selected: ((name, rename(name, new)) for name in selected))
+        print(f"{NORMAL_MODE}+reload({SELF} ls --fzf)")
+
+
+def cmd_logs(args):
+    name = names([args.name] if args.name else [])[0]
+    os.execvp("tail", ["tail", "-n", str(args.lines), *(["-f"] if args.follow else []), str(log_path(name))])
+
+
+def job_url(name):
+    """The first local URL the current run logged on a port the job listens on, else
+    http://localhost:<first port>, else None."""
+    listening = next(jobs(only=name))["ports"]
+    if not listening:
+        return None
+    with open(log_path(name), "rb") as f:
+        f.seek(max(0, f.seek(0, os.SEEK_END) - 1_000_000))
+        text = ANSI_RE.sub("", f.read().decode(errors="replace"))
+    # The log's last tend header line starts the current run.
+    run = text[text.rfind(" tend: ") :]
+    for match in URL_RE.finditer(run):
+        if int(match["port"]) in listening:
+            return f"{match['scheme']}://localhost:{match['port']}{match['path'] or ''}"
+    return f"http://localhost:{listening[0]}"
+
+
+def cmd_open(args):
+    name = names([args.name] if args.name else [])[0]
+    url = job_url(name)
+    if not url:
+        raise TendError(f"{name}: not listening on any port, see tend logs {name}")
+    subprocess.run(["open", url], check=True)
+    print(f"{name}: opened {url}")
+
+
+def is_compose(name):
+    return compose_prefix(read_job(name)["ProgramArguments"][-1]) is not None
+
+
+def start_order(selected):
+    """Compose jobs first, so the services they run are up before the apps that use them."""
+    return sorted(selected, key=lambda name: not is_compose(name))
+
+
+def stop_order(selected):
+    return sorted(selected, key=is_compose)
+
+
+def wait_ready(name):
+    """Wait until a compose job's containers are all up, and healthy where they have a
+    healthcheck. Compose creates containers one by one, so the check has to pass twice in a row
+    with the same number of containers."""
+    job = read_job(name)
+    project = project_dir(job["WorkingDirectory"], compose_prefix(job["ProgramArguments"][-1]))
+    deadline = time.monotonic() + COMPOSE_READY_TIMEOUT
+    ready_count = None
+    while time.monotonic() < deadline:
+        if not job_status(name)[0]:
+            raise TendError(f"{name}: exited before its containers were ready, see tend logs {name}")
+        statuses = [status for status, _ in compose_containers().get(project, [])]
+        if any("(unhealthy)" in status for status in statuses):
+            raise TendError(f"{name}: a container is unhealthy, see tend logs {name}")
+        if statuses and all(status.startswith("Up") and "health: starting" not in status for status in statuses):
+            if ready_count == len(statuses):
+                return
+            ready_count = len(statuses)
+        else:
+            ready_count = None
+        time.sleep(2)
+    raise TendError(f"{name}: containers weren't ready within {COMPOSE_READY_TIMEOUT} seconds, see tend logs {name}")
+
+
+def stop_plan(selected, volumes=False):
+    for name in stop_order(selected):
+        stop_job(name, volumes)
+        yield name, f"{name}: stopped"
+
+
+def remove_plan(selected):
+    for name in stop_order(selected):
+        stop_job(name)
+        plist_path(name).unlink()
+        log_path(name).unlink(missing_ok=True)
+        yield name, f"{name}: removed"
+
+
+def restart_plan(selected):
+    """Stop the whole group, then start it, waiting on each compose job's containers when other
+    jobs start after it."""
+    for name in stop_order(selected):
+        stop_job(name)
+    starts = start_order(selected)
+    for i, name in enumerate(starts):
+        message = load(name, "restarted", "a")
+        if is_compose(name) and any(not is_compose(later) for later in starts[i + 1 :]):
+            print(f"{name}: waiting for its containers", flush=True)
+            wait_ready(name)
+            message += ", containers ready"
+        yield name, message
+
+
+def notify_fzf(action):
+    """POST an action to the fzf manager that ran this command (it runs with --listen)."""
+    port = os.environ.get("FZF_PORT")
+    if not port:
+        return
+    headers = {"x-api-key": os.environ["FZF_API_KEY"]} if "FZF_API_KEY" in os.environ else {}
+    request = urllib.request.Request(f"http://localhost:{port}", data=action.encode(), headers=headers, method="POST")
+    try:
+        urllib.request.urlopen(request, timeout=5).close()
+    except OSError:
+        pass
+
+
+def in_background(selected, busy, plan):
+    """Mark each job busy and return at once, so fzf's list shows it, then run `plan(selected)`
+    in a detached child that tells fzf to reload when it's done. Each job stops being busy as the
+    plan yields it. An error goes to the log of the job it names and ends the plan."""
+    for name in selected:
+        busy_path(name).write_text(busy)
+    if os.fork():
+        return
+    os.setsid()
+    # fzf's execute-silent waits on these, so the child lets go of them.
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    try:
+        for name, _ in plan(selected):
+            busy_path(name).unlink(missing_ok=True)
+    except TendError as e:
+        failed = str(e).split(":", 1)[0]
+        with open(log_path(failed if failed in selected else selected[0]), "a") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} tend: {e}\n")
+    finally:
+        for name in selected:
+            busy_path(name).unlink(missing_ok=True)
+        notify_fzf(f"reload({SELF} ls --fzf)")
+        os._exit(0)
+
+
+def each(args, busy, plan):
+    selected = names(args.names)
+    if args.fzf:
+        return in_background(selected, busy, plan)
+    for _, message in plan(selected):
+        print(message, flush=True)
+
+
+def cmd_stop(args):
+    each(args, "stopping", lambda selected: stop_plan(selected, args.volumes))
+
+
+def cmd_restart(args):
+    each(args, "restarting", restart_plan)
+
+
+def cmd_rm(args):
+    each(args, "removing", remove_plan)
+
+
+def check_new_name(new):
+    if not NAME_RE.match(new):
+        raise TendError(f"{new!r}: names are lowercase letters, digits, and hyphens")
+    if plist_path(new).exists():
+        raise TendError(f"{new}: a job with that name already exists")
+
+
+def rename(old, new):
+    """Move the job's plist and log to the new name. launchd can't relabel a loaded job, so a
+    running job is stopped and started again under the new name."""
+    check_new_name(new)
+    running = bool(job_status(old)[0])
+    if running:
+        stop_job(old)
+    else:
+        unload(old)
+    job = read_job(old)
+    job["Label"] = label(new)
+    job["StandardOutPath"] = job["StandardErrorPath"] = str(log_path(new))
+    with open(plist_path(new), "wb") as f:
+        plistlib.dump(job, f)
+    if log_path(old).exists():
+        log_path(old).rename(log_path(new))
+    plist_path(old).unlink()
+    if running:
+        return load(new, f"renamed from {old}", "a")
+    return f"{old}: renamed to {new}"
+
+
+def cmd_rename(args):
+    old = check_name(args.name)
+    if args.new:
+        print(rename(old, args.new))
+        return
+    if not sys.stdin.isatty():
+        raise TendError(f"pass the new name: tend rename {old} <new>")
+    note = " (running, so it restarts)" if job_status(old)[0] else ""
+    while True:
+        try:
+            new = input(f"Rename {old}{note} to: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not new or new == old:
+            return
+        try:
+            print(rename(old, new))
+            return
+        except TendError as e:
+            print(e)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="tend", description=__doc__.strip().splitlines()[0])
+    parser.add_argument("--version", action="version", version=f"tend {VERSION}")
+    parser.set_defaults(func=cmd_manage)
+    sub = parser.add_subparsers(dest="action", metavar="{run,ls,logs,open,rename,stop,restart,rm}")
+    # The manager's enter, esc and ctrl-e; not for typing.
+    key = sub.add_parser("_fzf")
+    key.add_argument("key", choices=["enter", "esc", "ctrl-e"])
+    key.add_argument("name", nargs="?", default="")
+    key.set_defaults(func=cmd_fzf_key)
+    run = sub.add_parser("run", help="start a command in the background")
+    run.add_argument("-n", "--name")
+    run.add_argument("command", nargs=argparse.REMAINDER)
+    run.set_defaults(func=cmd_run)
+    ls = sub.add_parser("ls", help="list jobs")
+    ls.add_argument("--json", action="store_true")
+    # Colored tab-separated rows for tend's own fzf views.
+    ls.add_argument("--fzf", action="store_true", help=argparse.SUPPRESS)
+    ls.set_defaults(func=cmd_ls)
+    logs = sub.add_parser("logs", help="print a job's log")
+    logs.add_argument("-f", "--follow", action="store_true")
+    logs.add_argument("-l", "--lines", type=int, default=100)
+    logs.add_argument("name", nargs="?")
+    logs.set_defaults(func=cmd_logs)
+    opener = sub.add_parser("open", help="open the job's local URL in the browser")
+    opener.add_argument("name", nargs="?")
+    opener.set_defaults(func=cmd_open)
+    renamer = sub.add_parser("rename", help="rename a job; a running job restarts")
+    renamer.add_argument("name")
+    renamer.add_argument("new", nargs="?", help="prompted for when left out")
+    renamer.set_defaults(func=cmd_rename)
+    for action, func, text in [
+        ("stop", cmd_stop, "stop jobs, keeping them for restart; compose jobs run down"),
+        ("restart", cmd_restart, "stop and start jobs; compose jobs run down, then up"),
+        ("rm", cmd_rm, "stop jobs and forget them"),
+    ]:
+        p = sub.add_parser(action, help=text)
+        p.add_argument("names", nargs="*")
+        # The fzf manager's keys: mark the job busy, work in the background, reload fzf after.
+        p.add_argument("--fzf", action="store_true", help=argparse.SUPPRESS)
+        if action == "stop":
+            p.add_argument("-v", "--volumes", action="store_true", help="compose jobs: down -v")
+        p.set_defaults(func=func)
+    args = parser.parse_args()
+    if theme() not in THEMES:
+        parser.error(f"TEND_THEME must be one of {', '.join(THEMES)}, got {theme()!r}")
+    if args.action == "run" and args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    try:
+        args.func(args)
+    except TendError as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
