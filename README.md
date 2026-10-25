@@ -48,7 +48,8 @@ and compose files.
 
 `tend` with no arguments opens the job list in fzf, with the focused job's log on the right.
 The list refreshes every 2 seconds, and only reloads when a row changed, because a reload
-restarts the log preview.
+restarts the log preview. The preview shows the last 1000 lines and updates when the focused log
+grows, except while you're scrolling it. Enter follows the log live in the terminal.
 
 | Key | Action |
 | --- | --- |

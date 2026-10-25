@@ -58,6 +58,14 @@ class TendTest(unittest.TestCase):
         patcher = mock.patch.object(tend, "job_status", return_value=(None, None))
         self.job_status = patcher.start()
         self.addCleanup(patcher.stop)
+        # jobs() asks launchd about every job at once; route that through the same mock.
+        patcher = mock.patch.object(
+            tend,
+            "job_statuses",
+            side_effect=lambda: {tend.label(p.stem): self.job_status(p.stem) for p in tend.JOBS.glob("*.plist")},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
 
 class ComposeParsingTest(TendTest):
@@ -450,6 +458,45 @@ class RefreshTest(TendTest):
             add_job("api", "dotnet run")
             self.assertTrue(self.refresh().startswith("reload(cat "))
             tend.rows_cache().unlink()
+
+
+class PreviewRefreshTest(TendTest):
+    def setUp(self):
+        super().setUp()
+        add_job("web", "npm run dev")
+        write_log("web", "one\n")
+        patcher = mock.patch.dict(os.environ, {"FZF_PORT": "test-preview", "FZF_ACTION": "down"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for path in (tend.rows_cache(), tend.rows_cache().with_suffix(".log")):
+            path.unlink(missing_ok=True)
+            self.addCleanup(path.unlink, missing_ok=True)
+        tend.refresh_actions("web")  # the first call reloads and records the rows
+
+    def test_refreshes_the_preview_only_when_the_focused_log_grows(self):
+        self.assertEqual(tend.refresh_actions("web"), [])
+        with open(tend.log_path("web"), "a") as log:
+            log.write("two\n")
+        self.assertEqual(tend.refresh_actions("web"), ["refresh-preview"])
+        self.assertEqual(tend.refresh_actions("web"), [])
+
+    def test_leaves_the_preview_alone_while_it_is_scrolled(self):
+        tend.refresh_actions("web")
+        with open(tend.log_path("web"), "a") as log:
+            log.write("two\n")
+        with mock.patch.dict(os.environ, {"FZF_ACTION": "preview-up"}):
+            self.assertEqual(tend.refresh_actions("web"), [])
+
+
+class FastListTest(TendTest):
+    def test_uses_remembered_ports_without_lsof(self):
+        add_job("web", "npm run dev")
+        tend.remember_ports("web", [5173])
+        self.job_status.return_value = (42, None)
+        with mock.patch.object(tend, "ports") as lsof, mock.patch.object(tend, "started", return_value=None):
+            job = next(tend.jobs(fast=True))
+        lsof.assert_not_called()
+        self.assertEqual(job["ports"], [5173])
 
 
 class CompleteTest(TendTest):

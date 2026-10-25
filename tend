@@ -55,7 +55,6 @@ import subprocess
 import tempfile
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 VERSION = "0.1.0"
@@ -217,6 +216,18 @@ def job_status(name):
     return pid, code
 
 
+def job_statuses():
+    """{label: (pid, last exit code)} for every loaded tend job, from one `launchctl list`. pid is
+    0 for a job that's loaded but not running."""
+    out = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+    found = {}
+    for line in out.stdout.splitlines()[1:]:
+        pid, code, job_label = (line.split("\t") + ["", ""])[:3]
+        if job_label.startswith("local.tend."):
+            found[job_label] = (int(pid) if pid.isdigit() else 0, int(code) if code.lstrip("-").isdigit() else None)
+    return found
+
+
 def ports(pid):
     """TCP ports the job's process group listens on. launchd makes each job a group leader."""
     out = subprocess.run(
@@ -322,12 +333,16 @@ def remember_ports(name, listening):
     ports_path(name).write_text(text)
 
 
-def port_conflicts(name):
-    """Warnings for ports the job used last time that another process holds now."""
+def remembered_ports(name):
     try:
-        remembered = json.loads(ports_path(name).read_text())
+        return json.loads(ports_path(name).read_text())
     except (FileNotFoundError, ValueError):
         return []
+
+
+def port_conflicts(name):
+    """Warnings for ports the job used last time that another process holds now."""
+    remembered = remembered_ports(name)
     return [
         f"{name}: port {port} is in use by {command} (pid {pid})"
         for port in remembered
@@ -357,8 +372,11 @@ def read_job(name):
         return plistlib.load(f)
 
 
-def jobs(only=None):
+def jobs(only=None, fast=False):
+    """Every job's state. `fast` skips lsof and docker and reports the ports a running job used
+    last time, so the manager can draw its first list at once."""
     published = None
+    statuses = job_statuses()
     for path in sorted(JOBS.glob("*.plist")):
         if only and path.stem != only:
             continue
@@ -366,16 +384,18 @@ def jobs(only=None):
         command = job["ProgramArguments"][-1]
         prefix = compose_prefix(command)
         compose = prefix is not None
-        pid, code = job_status(path.stem)
+        pid, code = statuses.get(label(path.stem), (None, None))
         running = bool(pid)
         listening = []
-        if running and compose:
+        if running and fast:
+            listening = remembered_ports(path.stem)
+        elif running and compose:
             # Docker's port forwarder holds the sockets, so ask docker.
             published = compose_ports() if published is None else published
             listening = sorted(published.get(project_dir(job["WorkingDirectory"], prefix), ()))
         elif running:
             listening = ports(pid)
-        if listening:
+        if listening and not fast:
             remember_ports(path.stem, listening)
         trim_log(path.stem)
         start = started(pid) if running else None
@@ -409,12 +429,12 @@ def paint(text, color, bold=False):
     return f"\x1b[{'1;' if bold else ''}{code}m{text}\x1b[0m"
 
 
-def table(color=False, fzf=False):
+def table(color=False, fzf=False, fast=False):
     """Aligned rows under a header row. fzf rows are tab-separated with the directory last, which
     the fzf views hide from the list and show in the preview label."""
     header = {"state": "", "name": "NAME", "status": "STATUS", "ports": "PORTS", "dir": "DIR", "command": "COMMAND"}
     rows = [header]
-    for job in jobs():
+    for job in jobs(fast=fast):
         status = {"running": f"up since {job['since']}", "exited": f"exited {job['exit_code']}"}.get(job["state"], "stopped")
         rows.append(
             {
@@ -685,11 +705,11 @@ def cmd_run(args):
     print(load(name, "started", "w"))
 
 
-def listing(color, fzf=False):
+def listing(color, fzf=False, fast=False):
     if not any(JOBS.glob("*.plist")):
         message = "no jobs; start one with tend run"
         return paint(message, "dim") if color else message
-    return "\n".join(table(color=color, fzf=fzf))
+    return "\n".join(table(color=color, fzf=fzf, fast=fast))
 
 
 def rows_cache():
@@ -702,7 +722,7 @@ def cmd_ls(args):
     if args.json:
         print(json.dumps({"jobs": list(jobs())}))
         return
-    rows = listing(color, args.fzf)
+    rows = listing(color, args.fzf, args.fast)
     if args.fzf and "FZF_PORT" in os.environ:
         rows_cache().write_text(rows)
     print(rows)
@@ -714,7 +734,7 @@ def keys(*pairs):
 
 def cmd_manage(args):
     if not interactive():
-        return cmd_ls(argparse.Namespace(json=False, fzf=False))
+        return cmd_ls(argparse.Namespace(json=False, fzf=False, fast=False))
     reload = f"reload({SELF} ls --fzf)"
     footer = "\n".join(
         [
@@ -734,8 +754,9 @@ def cmd_manage(args):
             "--multi",
             "--marker", "✓",
             "--footer", footer,
-            "--preview", f"{SELF} logs -f -l 200 {{2}}",
-            "--bind", f"start:{reload}",
+            # A plain tail, which exits, so fzf shows no spinner; the refresh re-runs it as the log grows.
+            "--preview", f"tail -n {PREVIEW_LINES} {shlex.quote(str(LOGS))}/{{2}}.log 2>/dev/null",
+            "--bind", f"start:reload({SELF} ls --fzf --fast)",
             "--bind", f"enter:transform:{SELF} _fzf enter {{2}}",
             "--bind", f"esc:transform:{SELF} _fzf esc",
             # {+2} is every marked job, or the focused one when none are marked.
@@ -746,12 +767,40 @@ def cmd_manage(args):
             "--bind", f"ctrl-o:execute-silent({SELF} open {{2}})",
             "--bind", f"ctrl-e:transform:{SELF} _fzf ctrl-e {{2}}",
             # Reloading restarts the log preview, so the refresh only reloads when a row changed.
-            "--bind", f"every({REFRESH_SECONDS}):bg-transform:{SELF} _fzf refresh",
+            "--bind", f"every({REFRESH_SECONDS}):bg-transform:{SELF} _fzf refresh {{2}}",
         ],
     )
 
 
 REFRESH_SECONDS = 2
+PREVIEW_LINES = 1000
+def refresh_actions(focused):
+    """The manager's refresh: reload when a row changed, else re-run the preview when the focused
+    job's log grew, unless the last action scrolled the preview, so reading back isn't cut off."""
+    rows = listing(color=True, fzf=True)
+    try:
+        unchanged = rows_cache().read_text() == rows
+    except FileNotFoundError:
+        unchanged = False
+    if not unchanged:
+        rows_cache().write_text(rows)
+        return [f"reload(cat {shlex.quote(str(rows_cache()))})"]
+    if not focused:
+        return []
+    try:
+        size = log_path(focused).stat().st_size
+    except FileNotFoundError:
+        return []
+    seen = rows_cache().with_suffix(".log")
+    last = seen.read_text() if seen.exists() else ""
+    seen.write_text(f"{focused} {size}")
+    if last == f"{focused} {size}" or not last.startswith(f"{focused} "):
+        return []
+    if os.environ.get("FZF_ACTION", "").startswith("preview-"):
+        return []
+    return ["refresh-preview"]
+
+
 RENAME_RE = re.compile(r"^rename (\S+) ❯ $")
 # Leaves rename mode: search back on, the normal prompt, query and list label.
 NORMAL_MODE = f"enable-search+change-prompt({PROMPT})+change-query()+change-list-label( jobs )"
@@ -762,14 +811,7 @@ def cmd_fzf_key(args):
     "rename <name> ❯ " with search off, so the query holds the new name while the list stays put."""
     renaming = RENAME_RE.match(os.environ.get("FZF_PROMPT", ""))
     if args.key == "refresh":
-        rows = listing(color=True, fzf=True)
-        try:
-            unchanged = rows_cache().read_text() == rows
-        except FileNotFoundError:
-            unchanged = False
-        if not unchanged:
-            rows_cache().write_text(rows)
-            print(f"reload(cat {shlex.quote(str(rows_cache()))})")
+        print("+".join(refresh_actions(args.name)))
     elif args.key == "ctrl-e":
         note = ", restarts it" if job_status(args.name)[0] else ""
         print(
@@ -899,6 +941,9 @@ def notify_fzf(action):
     port = os.environ.get("FZF_PORT")
     if not port:
         return
+    # Imported here: it's the slowest import, and only background actions need it.
+    import urllib.request
+
     headers = {"x-api-key": os.environ["FZF_API_KEY"]} if "FZF_API_KEY" in os.environ else {}
     request = urllib.request.Request(f"http://localhost:{port}", data=action.encode(), headers=headers, method="POST")
     try:
@@ -1042,6 +1087,8 @@ def main():
     ls.add_argument("--json", action="store_true")
     # Colored tab-separated rows for tend's own fzf views.
     ls.add_argument("--fzf", action="store_true", help=argparse.SUPPRESS)
+    # The manager's first list: remembered ports instead of lsof and docker.
+    ls.add_argument("--fast", action="store_true", help=argparse.SUPPRESS)
     ls.set_defaults(func=cmd_ls)
     logs = sub.add_parser("logs", help="print a job's log")
     logs.add_argument("-f", "--follow", action="store_true")
