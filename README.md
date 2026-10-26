@@ -49,7 +49,9 @@ and compose files.
 `tend` with no arguments opens the job list in fzf. ctrl-/ shows the focused job's log beside
 the list, or below it in terminals narrower than 150 columns, and hides it again. The list
 refreshes every 2 seconds, and only reloads when a row changed, because a reload restarts the
-log preview. The preview shows the last 1000 lines and updates when the focused log grows, except while you're scrolling it. Enter follows the log live in the terminal.
+log preview. The preview shows the last 1000 lines and updates when the focused log grows, except
+while you're scrolling it. Enter follows the log live in the terminal. Typing filters by job and
+service name.
 
 | Key | Action |
 | --- | --- |

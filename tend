@@ -601,6 +601,7 @@ def job_view(preview="visible"):
         "--header-lines", "1",
         "--delimiter", "\t",
         "--with-nth", "1..5",
+        "--nth", "2",
         "--tabstop", "1",
         "--id-nth", "7..8",
         "--track",
