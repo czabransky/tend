@@ -41,6 +41,10 @@ def add_job(name, command, directory="/work/app"):
         )
 
 
+def container(service, status, ports=""):
+    return {"service": service, "container": f"app-{service}-1", "status": status, "ports": ports}
+
+
 def write_log(name, text):
     tend.LOGS.mkdir(parents=True, exist_ok=True)
     tend.log_path(name).write_text(text)
@@ -100,8 +104,8 @@ class ComposeParsingTest(TendTest):
         add_job("root", "docker compose up", "/work/app")
         add_job("infra", "docker compose -f infra/compose.yml up", "/work/app")
         containers = {
-            "/work/app": [("Up 2 seconds", "0.0.0.0:8080->80/tcp")],
-            "/work/app/infra": [("Up 2 seconds", "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp")],
+            "/work/app": [container("web", "Up 2 seconds", "0.0.0.0:8080->80/tcp")],
+            "/work/app/infra": [container("db", "Up 2 seconds", "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp")],
         }
         self.job_status.return_value = (42, None)
         with mock.patch.object(tend, "compose_containers", return_value=containers), mock.patch.object(
@@ -109,6 +113,23 @@ class ComposeParsingTest(TendTest):
         ):
             ports = {job["name"]: job["ports"] for job in tend.jobs()}
         self.assertEqual(ports, {"infra": [5432], "root": [8080]})
+
+    def test_published_ranges_and_udp(self):
+        text = (
+            "0.0.0.0:7880-7881->7880-7881/tcp, [::]:7880-7881->7880-7881/tcp, "
+            "0.0.0.0:50000-50002->50000-50002/udp, 6379/tcp, 0.0.0.0:4317->18889/tcp"
+        )
+        self.assertEqual(tend.published_ports(text), {"tcp": {4317, 7880, 7881}, "udp": {50000, 50001, 50002}})
+
+    def test_compact_ports(self):
+        self.assertEqual(tend.compact([8025, 1025, 7881, 7880, 7882]), "1025,7880-7882,8025")
+        self.assertEqual(tend.compact([]), "")
+
+    def test_remembered_ports_from_before_udp(self):
+        add_job("web", "npm run dev")
+        tend.ports_path("web").write_text("[5173]")
+        self.assertEqual(tend.remembered_ports("web"), [5173])
+        self.assertEqual(tend.remembered_ports("web", "udp"), [])
 
 
 class NamesTest(TendTest):
@@ -170,7 +191,7 @@ class WaitReadyTest(TendTest):
         self.addCleanup(patcher.stop)
 
     def run_with(self, *polls):
-        states = [{"/work/app": [(status, "") for status in poll]} for poll in polls]
+        states = [{"/work/app": [container("svc", status) for status in poll]} for poll in polls]
         with mock.patch.object(tend, "compose_containers", side_effect=states) as containers:
             tend.wait_ready("db")
         return containers.call_count
@@ -245,17 +266,63 @@ class UrlTest(TendTest):
 
 
 class TableTest(TendTest):
-    def test_fzf_rows_hide_nothing_and_put_the_directory_last(self):
-        job = {
-            "name": "pf-api", "state": "running", "since": "14:02", "exit_code": None, "ports": [5126],
-            "dir": "/work/api", "command": "dotnet run", "busy": None,
+    JOB = {
+        "name": "pf-api", "state": "running", "since": "14:02", "exit_code": None, "ports": [5126], "udp_ports": [],
+        "services": [], "dir": "/work/api", "command": "dotnet run", "busy": None,
+    }
+
+    def rows(self, *jobs, **options):
+        with mock.patch.object(tend, "jobs", return_value=list(jobs)):
+            return [[cell.strip() for cell in line.split("\t")] for line in tend.table(fzf=True, **options)]
+
+    def test_fzf_rows_end_with_hidden_dir_job_and_service(self):
+        busy = {**self.JOB, "name": "pf-db", "busy": "stopping", "ports": []}
+        header, api, db = self.rows(self.JOB, busy)
+        self.assertEqual(header[:6], ["", "NAME", "STATUS", "PORTS", "COMMAND", "DIR"])
+        self.assertEqual(api, ["●", "pf-api", "up since 14:02", "5126", "dotnet run", "/work/api", "pf-api", ""])
+        self.assertEqual(db[:3], ["◐", "pf-db", "stopping…"])
+
+    def test_compose_services_are_rows_under_their_job(self):
+        services = [
+            {"service": "livekit", "container": "x", "status": "up", "ports": [7880, 7881], "udp_ports": [50000, 50001]},
+            {"service": "postgres", "container": "y", "status": "healthy", "ports": [5439], "udp_ports": []},
+        ]
+        compose = {**self.JOB, "name": "pf-docker", "command": "docker compose up", "services": services}
+        _, job, livekit, postgres = self.rows(compose)
+        self.assertEqual(job[3], "")
+        self.assertEqual(livekit[1:4], ["├─ livekit", "up", "7880-7881,50000-50001/udp"])
+        self.assertEqual(postgres[1:4], ["└─ postgres", "healthy", "5439"])
+        self.assertEqual(postgres[6:], ["pf-docker", "postgres"])
+
+    def test_colored_rows_render(self):
+        services = [{"service": "db", "container": "y", "status": "unhealthy", "ports": [], "udp_ports": []}]
+        with mock.patch.object(tend, "jobs", return_value=[{**self.JOB, "services": services}]):
+            self.assertEqual(len(tend.table(color=True, fzf=True)), 3)
+            self.assertEqual(len(tend.table(color=True)), 3)
+
+
+class ServiceTest(TendTest):
+    def test_health(self):
+        cases = {
+            "Up 4 minutes": "up",
+            "Up 4 minutes (healthy)": "healthy",
+            "Up 3 seconds (health: starting)": "starting",
+            "Up 9 minutes (unhealthy)": "unhealthy",
+            "Restarting (1) 2 seconds ago": "restarting",
         }
-        busy = {**job, "name": "pf-db", "busy": "stopping", "ports": []}
-        with mock.patch.object(tend, "jobs", return_value=[job, busy]):
-            header, api, db = (line.split("\t") for line in tend.table(fzf=True))
-        self.assertEqual([cell.strip() for cell in header], ["", "NAME", "STATUS", "PORTS", "COMMAND", "DIR"])
-        self.assertEqual([cell.strip() for cell in api], ["●", "pf-api", "up since 14:02", "5126", "dotnet run", "/work/api"])
-        self.assertEqual([cell.strip() for cell in db][:3], ["◐", "pf-db", "stopping…"])
+        for status, word in cases.items():
+            with self.subTest(status=status):
+                self.assertEqual(tend.health(status), word)
+
+    def test_services_sorted_with_their_own_ports(self):
+        containers = {"/w": [container("redis", "Up 1 minute", "6379/tcp"), container("db", "Up 1 minute (healthy)", "0.0.0.0:5439->5432/tcp")]}
+        services = tend.compose_services(containers)["/w"]
+        self.assertEqual([(s["service"], s["status"], s["ports"]) for s in services], [("db", "healthy", [5439]), ("redis", "up", [])])
+
+    def test_open_a_service_port(self):
+        services = [{"service": "mailpit", "container": "x", "status": "up", "ports": [1025, 8025], "udp_ports": []}]
+        with mock.patch.object(tend, "jobs", return_value=iter([{"services": services, "ports": [1025, 8025]}])):
+            self.assertEqual(tend.job_url("pf-docker", "mailpit"), "http://localhost:1025")
 
 
 class ThemeTest(TendTest):

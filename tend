@@ -95,7 +95,8 @@ LOG_LIMIT = 10 * 1024 * 1024
 LOG_KEEP = 2 * 1024 * 1024
 # A keep-alive job that crashes is started again after this many seconds.
 KEEP_ALIVE_THROTTLE = 5
-PUBLISHED_RE = re.compile(r":(\d+)->")
+# A published port or range in `docker ps` output, e.g. "0.0.0.0:7880-7881->7880-7881/tcp".
+PUBLISHED_RE = re.compile(r":(\d+)(?:-(\d+))?->[^/,]*/(tcp|udp)")
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 URL_RE = re.compile(
     r"(?P<scheme>https?)://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):(?P<port>\d+)(?P<path>/[^\s'\"<>]*)?"
@@ -268,26 +269,75 @@ def project_dir(directory, prefix):
 
 
 def compose_containers():
-    """{project directory: [(status, ports)]} for running compose containers."""
-    template = '{{.Label "com.docker.compose.project.working_dir"}}\t{{.Status}}\t{{.Ports}}'
+    """{project directory: [container]} for running compose containers, each a dict of service,
+    container name, docker status and the Ports column."""
+    template = "\t".join(
+        [
+            '{{.Label "com.docker.compose.project.working_dir"}}',
+            '{{.Label "com.docker.compose.service"}}',
+            "{{.Names}}",
+            "{{.Status}}",
+            "{{.Ports}}",
+        ]
+    )
     try:
         out = subprocess.run(["docker", "ps", "--format", template], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         return {}
     found = {}
     for line in out.stdout.splitlines():
-        directory, status, published = (line.split("\t") + ["", ""])[:3]
+        directory, service, name, status, published = (line.split("\t") + [""] * 4)[:5]
         if directory:
-            found.setdefault(os.path.normpath(directory), []).append((status, published))
+            container = {"service": service, "container": name, "status": status, "ports": published}
+            found.setdefault(os.path.normpath(directory), []).append(container)
     return found
 
 
-def compose_ports():
-    """{project directory: published ports} for running compose containers."""
-    return {
-        directory: {int(p) for _, published in containers for p in PUBLISHED_RE.findall(published)}
-        for directory, containers in compose_containers().items()
-    }
+def health(status):
+    """A container's docker status in one word: up, healthy, starting, unhealthy, restarting..."""
+    for marker, word in [("(healthy)", "healthy"), ("health: starting", "starting"), ("(unhealthy)", "unhealthy")]:
+        if marker in status:
+            return word
+    return status.split(" ", 1)[0].lower() or "unknown"
+
+
+def published_ports(text):
+    """{"tcp": ports, "udp": ports} published in one container's `docker ps` Ports column."""
+    found = {"tcp": set(), "udp": set()}
+    for first, last, protocol in PUBLISHED_RE.findall(text):
+        found[protocol].update(range(int(first), int(last or first) + 1))
+    return found
+
+
+def compose_services(containers):
+    """{project directory: [service]} with each service's health and published ports, by name."""
+    found = {}
+    for directory, project in containers.items():
+        services = []
+        for container in project:
+            published = published_ports(container["ports"])
+            services.append(
+                {
+                    "service": container["service"] or container["container"],
+                    "container": container["container"],
+                    "status": health(container["status"]),
+                    "ports": sorted(published["tcp"]),
+                    "udp_ports": sorted(published["udp"]),
+                }
+            )
+        found[directory] = sorted(services, key=lambda service: service["service"])
+    return found
+
+
+def compact(ports):
+    """Ports as a short list, with runs as ranges: [1025, 7880, 7881] -> "1025,7880-7881"."""
+    runs = []
+    for port in sorted(ports):
+        if runs and port == runs[-1][1] + 1:
+            runs[-1][1] = port
+        else:
+            runs.append([port, port])
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
 
 
 def started(pid):
@@ -323,8 +373,8 @@ def holders(port):
     return found
 
 
-def remember_ports(name, listening):
-    text = json.dumps(listening)
+def remember_ports(name, listening, udp=(), services=()):
+    text = json.dumps({"tcp": list(listening), "udp": list(udp), "services": list(services)})
     try:
         if ports_path(name).read_text() == text:
             return
@@ -333,11 +383,16 @@ def remember_ports(name, listening):
     ports_path(name).write_text(text)
 
 
-def remembered_ports(name):
+def remembered_ports(name, protocol="tcp"):
+    """The job's remembered "tcp" or "udp" ports, or its compose "services"."""
     try:
-        return json.loads(ports_path(name).read_text())
+        saved = json.loads(ports_path(name).read_text())
     except (FileNotFoundError, ValueError):
         return []
+    # Files written before UDP was tracked hold a plain list of TCP ports.
+    if isinstance(saved, list):
+        return saved if protocol == "tcp" else []
+    return saved.get(protocol, [])
 
 
 def port_conflicts(name):
@@ -386,17 +441,20 @@ def jobs(only=None, fast=False):
         compose = prefix is not None
         pid, code = statuses.get(label(path.stem), (None, None))
         running = bool(pid)
-        listening = []
+        listening, udp, services = [], [], []
         if running and fast:
-            listening = remembered_ports(path.stem)
+            listening, udp = remembered_ports(path.stem), remembered_ports(path.stem, "udp")
+            services = remembered_ports(path.stem, "services")
         elif running and compose:
             # Docker's port forwarder holds the sockets, so ask docker.
-            published = compose_ports() if published is None else published
-            listening = sorted(published.get(project_dir(job["WorkingDirectory"], prefix), ()))
+            published = compose_services(compose_containers()) if published is None else published
+            services = published.get(project_dir(job["WorkingDirectory"], prefix), [])
+            listening = sorted({port for service in services for port in service["ports"]})
+            udp = sorted({port for service in services for port in service["udp_ports"]})
         elif running:
             listening = ports(pid)
-        if listening and not fast:
-            remember_ports(path.stem, listening)
+        if (listening or udp or services) and not fast:
+            remember_ports(path.stem, listening, udp, services)
         trim_log(path.stem)
         start = started(pid) if running else None
         yield {
@@ -409,6 +467,8 @@ def jobs(only=None, fast=False):
             "since": since(start) if start else None,
             "keep_alive": "KeepAlive" in job,
             "ports": listening,
+            "udp_ports": udp,
+            "services": services,
             "dir": job["WorkingDirectory"],
             "command": command,
             "log": str(log_path(path.stem)),
@@ -429,40 +489,85 @@ def paint(text, color, bold=False):
     return f"\x1b[{'1;' if bold else ''}{code}m{text}\x1b[0m"
 
 
+SERVICE_COLORS = {"up": "green", "healthy": "green", "starting": "yellow", "restarting": "yellow"}
+
+
+def port_text(tcp, udp):
+    return ",".join(part for part in [compact(tcp), compact(udp) + "/udp" if udp else ""] if part) or "-"
+
+
 def table(color=False, fzf=False, fast=False):
-    """Aligned rows under a header row. fzf rows are tab-separated with the directory last, which
-    the fzf views hide from the list and show in the preview label."""
-    header = {"state": "", "name": "NAME", "status": "STATUS", "ports": "PORTS", "dir": "DIR", "command": "COMMAND"}
+    """Aligned rows under a header row, each compose job followed by a row per service. fzf rows
+    are tab-separated and end with hidden fields: the directory (shown in the preview label), the
+    job name and the service name, which the manager's keys act on."""
+    header = {"kind": "header", "state": "", "name": "NAME", "status": "STATUS", "ports": "PORTS", "dir": "DIR",
+              "command": "COMMAND", "job": "", "service": ""}
     rows = [header]
     for job in jobs(fast=fast):
         status = {"running": f"up since {job['since']}", "exited": f"exited {job['exit_code']}"}.get(job["state"], "stopped")
+        services = job["services"]
+        directory = job["dir"].replace(str(Path.home()), "~", 1)
         rows.append(
             {
+                "kind": "job",
                 "state": "busy" if job["busy"] else job["state"],
                 "name": job["name"],
                 "status": f"{job['busy']}…" if job["busy"] else status,
-                "ports": ",".join(map(str, job["ports"])) or "-",
-                "dir": job["dir"].replace(str(Path.home()), "~", 1),
+                # A compose job's ports are on its service rows.
+                "ports": "" if services else port_text(job["ports"], job["udp_ports"]),
+                "dir": directory,
                 "command": job["command"],
+                "job": job["name"],
+                "service": "",
             }
         )
-    columns = ["state", "name", "status", "ports", *(["command", "dir"] if fzf else ["dir", "command"])]
-    widths = {c: max(1 if c == "state" else len(row[c]) for row in rows) for c in columns[:-1]}
+        for i, service in enumerate(services):
+            branch = "└─" if i == len(services) - 1 else "├─"
+            rows.append(
+                {
+                    "kind": "service",
+                    "state": service["status"],
+                    "name": f"{branch} {service['service']}",
+                    "status": service["status"],
+                    "ports": port_text(service["ports"], service["udp_ports"]),
+                    "dir": directory,
+                    "command": "",
+                    "job": job["name"],
+                    "service": service["service"],
+                }
+            )
+    columns = ["state", "name", "status", "ports", *(["command", "dir", "job", "service"] if fzf else ["dir", "command"])]
+    # The hidden fzf fields and the last visible column need no padding.
+    padded = columns[: columns.index("command")] if fzf else columns[:-1]
+    widths = {c: max(1 if c == "state" else len(row[c]) for row in rows) for c in padded}
     lines = []
     for row in rows:
         cells = []
         for c in columns:
-            text = (" " if row is header else "◐" if row[c] == "busy" else "●") if c == "state" else row[c]
+            if c == "state":
+                text = "●" if row["kind"] == "job" and row["state"] != "busy" else "◐" if row["kind"] == "job" else " "
+            elif c == "dir" and row["kind"] == "service" and not fzf:
+                # fzf keeps it for the preview label; the plain table shows it once, on the job.
+                text = ""
+            else:
+                text = row[c]
             # fzf shows each tab as one space (--tabstop 1); the extra pad keeps a two-space gap.
             text = text.ljust(widths[c] + fzf) if c in widths else text
-            if color and row is header:
+            if not color or c in ("job", "service") or (row["kind"] == "service" and c == "state"):
+                pass
+            elif row["kind"] == "header":
                 text = paint(text, "dim")
-            elif color and c in ("state", "status"):
+            elif row["kind"] == "service" and c == "name":
+                branch, rest = text[:2], text[2:]
+                text = paint(branch, "dim") + paint(rest, "subtext")
+            elif row["kind"] == "service" and c == "status":
+                text = paint(text, SERVICE_COLORS.get(row["state"], "red"))
+            elif c in ("state", "status"):
                 text = paint(text, STATE_COLORS[row["state"]])
-            elif color and c in COLUMN_COLORS:
+            elif c in COLUMN_COLORS:
                 text = paint(text, COLUMN_COLORS[c], bold=c == "name")
             cells.append(text)
-        lines.append(("\t" if fzf else "  ").join(cells))
+        lines.append(("\t" if fzf else "  ").join(cells).rstrip(" "))
     return lines
 
 
@@ -487,19 +592,23 @@ def style():
     ]
 
 
-def job_view():
+def job_view(preview="visible"):
     """fzf options for a list of `tend ls --fzf` rows with a log preview of the focused job."""
+    side, below = ("right,62%,follow,wrap", "down,50%,follow,wrap")
+    if preview == "hidden":
+        side, below = f"{side},hidden", f"{below},hidden"
     return [
         "--header-lines", "1",
         "--delimiter", "\t",
         "--with-nth", "1..5",
         "--tabstop", "1",
-        "--id-nth", "2",
+        "--id-nth", "7..8",
         "--track",
         "--ghost", "filter jobs",
         "--list-label", " jobs ",
-        "--preview-window", "right,62%,follow,wrap,<150(down,65%,follow,wrap)",
-        "--bind", "focus:transform-preview-label:printf ' %s  %s ' {2} {6}",
+        # fzf compares the threshold with the preview's width: 93 is 62% of a 150-column terminal.
+        "--preview-window", f"{side},<93({below})",
+        "--bind", "focus:transform-preview-label:printf ' %s  %s ' {7} {6}",
     ]
 
 
@@ -511,8 +620,8 @@ def fzf(lines, *options):
 def pick():
     if not interactive() or not any(JOBS.glob("*.plist")):
         return None
-    line = fzf(table(color=True, fzf=True), *job_view(), "--preview", f"{SELF} logs -l 200 {{2}}")
-    return line.split("\t")[1].strip() if line else None
+    line = fzf(table(color=True, fzf=True), *job_view(), "--preview", f"{SELF} logs -l 200 {{7}}")
+    return line.split("\t")[6].strip() if line else None
 
 
 def unload(name, timeout=10):
@@ -738,7 +847,7 @@ def cmd_manage(args):
     reload = f"reload({SELF} ls --fzf)"
     footer = "\n".join(
         [
-            keys(("enter", "follow log"), ("ctrl-o", "open url"), ("ctrl-e", "rename")),
+            keys(("enter", "follow log"), ("ctrl-/", "show log"), ("ctrl-o", "open url"), ("ctrl-e", "rename")),
             keys(("ctrl-s", "stop"), ("ctrl-r", "restart"), ("ctrl-x", "remove"), ("tab", "mark"), ("ctrl-a", "mark all")),
             keys(("↑↓", "move"), ("type", "filter"), ("shift-↑↓", "scroll log"), ("esc", "quit")),
         ]
@@ -748,26 +857,28 @@ def cmd_manage(args):
         [
             "fzf",
             *style(),
-            *job_view(),
+            # The log starts hidden, so the list has the whole terminal; ctrl-/ shows it.
+            *job_view(preview="hidden"),
             "--input-label", " tend ",
             "--listen",
             "--multi",
             "--marker", "✓",
             "--footer", footer,
             # A plain tail, which exits, so fzf shows no spinner; the refresh re-runs it as the log grows.
-            "--preview", f"tail -n {PREVIEW_LINES} {shlex.quote(str(LOGS))}/{{2}}.log 2>/dev/null",
+            "--preview", f"tail -n {PREVIEW_LINES} {shlex.quote(str(LOGS))}/{{7}}.log 2>/dev/null",
             "--bind", f"start:reload({SELF} ls --fzf --fast)",
-            "--bind", f"enter:transform:{SELF} _fzf enter {{2}}",
+            "--bind", f"enter:transform:{SELF} _fzf enter {{7}}",
             "--bind", f"esc:transform:{SELF} _fzf esc",
-            # {+2} is every marked job, or the focused one when none are marked.
-            "--bind", f"ctrl-s:execute-silent({SELF} stop --fzf {{+2}})+clear-selection+{reload}",
-            "--bind", f"ctrl-r:execute-silent({SELF} restart --fzf {{+2}})+clear-selection+{reload}",
-            "--bind", f"ctrl-x:execute-silent({SELF} rm --fzf {{+2}})+clear-selection+{reload}",
+            # {+7} is the job of every marked row, or of the focused one when none are marked.
+            "--bind", f"ctrl-s:execute-silent({SELF} stop --fzf {{+7}})+clear-selection+{reload}",
+            "--bind", f"ctrl-r:execute-silent({SELF} restart --fzf {{+7}})+clear-selection+{reload}",
+            "--bind", f"ctrl-x:execute-silent({SELF} rm --fzf {{+7}})+clear-selection+{reload}",
             "--bind", "ctrl-a:toggle-all",
-            "--bind", f"ctrl-o:execute-silent({SELF} open {{2}})",
-            "--bind", f"ctrl-e:transform:{SELF} _fzf ctrl-e {{2}}",
+            "--bind", "ctrl-/:toggle-preview",
+            "--bind", f"ctrl-o:execute-silent({SELF} open {{7}} --service {{8}})",
+            "--bind", f"ctrl-e:transform:{SELF} _fzf ctrl-e {{7}}",
             # Reloading restarts the log preview, so the refresh only reloads when a row changed.
-            "--bind", f"every({REFRESH_SECONDS}):bg-transform:{SELF} _fzf refresh {{2}}",
+            "--bind", f"every({REFRESH_SECONDS}):bg-transform:{SELF} _fzf refresh {{7}}",
         ],
     )
 
@@ -843,10 +954,14 @@ def cmd_logs(args):
     os.execvp("tail", ["tail", "-n", str(args.lines), *(["-f"] if args.follow else []), str(log_path(name))])
 
 
-def job_url(name):
-    """The first local URL the current run logged on a port the job listens on, else
-    http://localhost:<first port>, else None."""
-    listening = next(jobs(only=name))["ports"]
+def job_url(name, service=None):
+    """For a compose service, http://localhost:<its first port>. Otherwise the first local URL the
+    current run logged on a port the job listens on, else http://localhost:<first port>, else None."""
+    job = next(jobs(only=name))
+    if service:
+        ports = next((s["ports"] for s in job["services"] if s["service"] == service), [])
+        return f"http://localhost:{ports[0]}" if ports else None
+    listening = job["ports"]
     if not listening:
         return None
     with open(log_path(name), "rb") as f:
@@ -862,9 +977,10 @@ def job_url(name):
 
 def cmd_open(args):
     name = names([args.name] if args.name else [])[0]
-    url = job_url(name)
+    url = job_url(name, args.service)
     if not url:
-        raise TendError(f"{name}: not listening on any port, see tend logs {name}")
+        what = f"{name}'s {args.service} service" if args.service else name
+        raise TendError(f"{what}: not listening on any TCP port, see tend logs {name}")
     subprocess.run(["open", url], check=True)
     print(f"{name}: opened {url}")
 
@@ -893,7 +1009,7 @@ def wait_ready(name):
     while time.monotonic() < deadline:
         if not job_status(name)[0]:
             raise TendError(f"{name}: exited before its containers were ready, see tend logs {name}")
-        statuses = [status for status, _ in compose_containers().get(project, [])]
+        statuses = [container["status"] for container in compose_containers().get(project, [])]
         if any("(unhealthy)" in status for status in statuses):
             raise TendError(f"{name}: a container is unhealthy, see tend logs {name}")
         if statuses and all(status.startswith("Up") and "health: starting" not in status for status in statuses):
@@ -1097,6 +1213,7 @@ def main():
     logs.set_defaults(func=cmd_logs)
     opener = sub.add_parser("open", help="open the job's local URL in the browser")
     opener.add_argument("name", nargs="?")
+    opener.add_argument("--service", help="a compose job's service: open its first port")
     opener.set_defaults(func=cmd_open)
     renamer = sub.add_parser("rename", help="rename a job; a running job restarts")
     renamer.add_argument("name")

@@ -31,7 +31,7 @@ tend run -- pnpm dev            # job named after the current directory; -n pick
 tend run --keep-alive -- pnpm dev   # start it again whenever it crashes
 tend run                        # pick a package.json script, .csproj or compose file in fzf
 tend run -- docker compose up
-tend                            # manage jobs in fzf with a live log preview
+tend                            # manage jobs in fzf; ctrl-/ shows the log
 tend ls --json                  # for other tools, e.g. a dashboard
 tend open [name]                # open the URL the job logged in the browser
 tend logs -f | stop | restart | rm [name]
@@ -46,15 +46,16 @@ and compose files.
 
 ## Job manager
 
-`tend` with no arguments opens the job list in fzf, with the focused job's log on the right.
-The list refreshes every 2 seconds, and only reloads when a row changed, because a reload
-restarts the log preview. The preview shows the last 1000 lines and updates when the focused log
-grows, except while you're scrolling it. Enter follows the log live in the terminal.
+`tend` with no arguments opens the job list in fzf. ctrl-/ shows the focused job's log beside
+the list, or below it in terminals narrower than 150 columns, and hides it again. The list
+refreshes every 2 seconds, and only reloads when a row changed, because a reload restarts the
+log preview. The preview shows the last 1000 lines and updates when the focused log grows, except while you're scrolling it. Enter follows the log live in the terminal.
 
 | Key | Action |
 | --- | --- |
 | enter | Follow the log in the terminal |
-| ctrl-o | Open the job's URL |
+| ctrl-/ | Show or hide the log |
+| ctrl-o | Open the job's URL; on a service row, that service's first port |
 | ctrl-e | Rename the job in place; enter applies, esc cancels |
 | ctrl-s | Stop (compose: `down`) |
 | ctrl-r | Restart (compose: `down`, then `up`) |
@@ -80,8 +81,10 @@ Stopping a job unloads it from launchd, which sends `SIGTERM` and then kills wha
 process group, including the `node` or app process a wrapper like `npm` or `dotnet run` started.
 
 A plain `docker compose ... up` command is a compose job. `stop` runs `docker compose ... down`
-with the same global flags, launchd gives compose 120 seconds to stop its containers, and its
-ports come from `docker ps`.
+with the same global flags, and launchd gives compose 120 seconds to stop its containers. Each of
+its services gets a row under it, with the container's state (up, healthy, starting, unhealthy)
+and its published ports from `docker ps`, TCP ranges and UDP included. The manager's keys act on
+the parent job from a service row.
 
 With several jobs, stop and remove take compose jobs last. Restart stops the whole group, then
 starts compose jobs first and waits until their containers are up, and healthy where they have a
