@@ -241,11 +241,11 @@ class CandidatesTest(TendTest):
 
 
 class UrlTest(TendTest):
-    def url(self, log, ports):
+    def url(self, log, ports, port=None):
         add_job("web", "npm run dev")
         write_log("web", log)
         with mock.patch.object(tend, "jobs", return_value=iter([{"ports": ports}])):
-            return tend.job_url("web")
+            return tend.job_url("web", port=port)
 
     def test_vite_url_with_colors_from_the_current_run(self):
         log = (
@@ -259,6 +259,19 @@ class UrlTest(TendTest):
     def test_only_listening_ports_count(self):
         log = "2026 tend: started: dotnet run\nNow listening on: https://localhost:7001\nNow listening on: http://localhost:5126\n"
         self.assertEqual(self.url(log, [5126]), "http://localhost:5126")
+
+    def test_dev_server_local_url_wins_over_an_earlier_one(self):
+        log = (
+            "2026 tend: started: pnpm dev\n"
+            ". dev:server: Token Wars server on http://127.0.0.1:4317 (containers call http://host.docker.internal:4317)\n"
+            ". dev:web:   \x1b[32m\u279c\x1b[39m  \x1b[1mLocal\x1b[22m:   \x1b[36mhttp://localhost:\x1b[1m5173\x1b[22m/\x1b[39m\n"
+        )
+        self.assertEqual(self.url(log, [4317, 5173]), "http://localhost:5173/")
+        self.assertEqual(self.url(log, [4317, 5173], port=4317), "http://localhost:4317")
+
+    def test_port_not_listening(self):
+        self.assertIsNone(self.url("2026 tend: started: x\n", [5173], port=4317))
+        self.assertEqual(self.url("2026 tend: started: x\n", [4317, 5173], port=5173), "http://localhost:5173")
 
     def test_fallback_and_nothing(self):
         self.assertEqual(self.url("2026 tend: started: x\nready\n", [8080]), "http://localhost:8080")

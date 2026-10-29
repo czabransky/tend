@@ -27,3 +27,4 @@ complete -c tend -n "__fish_seen_subcommand_from ls" -l json -d "JSON for other 
 complete -c tend -n "__fish_seen_subcommand_from logs" -s f -l follow -d "Keep printing new lines"
 complete -c tend -n "__fish_seen_subcommand_from logs" -s l -l lines -x -d "Lines to print"
 complete -c tend -n "__fish_seen_subcommand_from stop" -s v -l volumes -d "Compose jobs: down -v"
+complete -c tend -n "__fish_seen_subcommand_from open" -l port -x -d "Open the job's URL on this port"

@@ -101,6 +101,8 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 URL_RE = re.compile(
     r"(?P<scheme>https?)://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1?\]):(?P<port>\d+)(?P<path>/[^\s'\"<>]*)?"
 )
+# Vite, Next, Nuxt and Astro print the browser URL on a "Local" line.
+LOCAL_RE = re.compile(r"\bLocal\b")
 LOCKFILES = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun"), ("bun.lockb", "bun")]
 SKIP_DIRS = {".git", "node_modules", "bin", "obj"}
 SELF = shlex.quote(os.path.abspath(sys.argv[0]))
@@ -955,14 +957,15 @@ def cmd_logs(args):
     os.execvp("tail", ["tail", "-n", str(args.lines), *(["-f"] if args.follow else []), str(log_path(name))])
 
 
-def job_url(name, service=None):
-    """For a compose service, http://localhost:<its first port>. Otherwise the first local URL the
-    current run logged on a port the job listens on, else http://localhost:<first port>, else None."""
+def job_url(name, service=None, port=None):
+    """For a compose service, http://localhost:<its first port>. Otherwise the local URL the current
+    run logged on a port the job listens on, preferring a dev server's "Local:" line, else
+    http://localhost:<first port>, else None. port limits the choice to that port."""
     job = next(jobs(only=name))
     if service:
         ports = next((s["ports"] for s in job["services"] if s["service"] == service), [])
         return f"http://localhost:{ports[0]}" if ports else None
-    listening = job["ports"]
+    listening = [p for p in job["ports"] if port in (None, p)]
     if not listening:
         return None
     with open(log_path(name), "rb") as f:
@@ -970,18 +973,25 @@ def job_url(name, service=None):
         text = ANSI_RE.sub("", f.read().decode(errors="replace"))
     # The log's last tend header line starts the current run.
     run = text[text.rfind(" tend: ") :]
-    for match in URL_RE.finditer(run):
-        if int(match["port"]) in listening:
-            return f"{match['scheme']}://localhost:{match['port']}{match['path'] or ''}"
+    urls = [
+        (line, match)
+        for line in run.splitlines()
+        for match in URL_RE.finditer(line)
+        if int(match["port"]) in listening
+    ]
+    if urls:
+        _, match = next((url for url in urls if LOCAL_RE.search(url[0])), urls[0])
+        return f"{match['scheme']}://localhost:{match['port']}{match['path'] or ''}"
     return f"http://localhost:{listening[0]}"
 
 
 def cmd_open(args):
     name = names([args.name] if args.name else [])[0]
-    url = job_url(name, args.service)
+    url = job_url(name, args.service, args.port)
     if not url:
         what = f"{name}'s {args.service} service" if args.service else name
-        raise TendError(f"{what}: not listening on any TCP port, see tend logs {name}")
+        where = f"on port {args.port}" if args.port else "on any TCP port"
+        raise TendError(f"{what}: not listening {where}, see tend logs {name}")
     subprocess.run(["open", url], check=True)
     print(f"{name}: opened {url}")
 
@@ -1215,6 +1225,7 @@ def main():
     opener = sub.add_parser("open", help="open the job's local URL in the browser")
     opener.add_argument("name", nargs="?")
     opener.add_argument("--service", help="a compose job's service: open its first port")
+    opener.add_argument("--port", type=int, help="open the job's URL on this port")
     opener.set_defaults(func=cmd_open)
     renamer = sub.add_parser("rename", help="rename a job; a running job restarts")
     renamer.add_argument("name")

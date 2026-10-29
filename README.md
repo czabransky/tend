@@ -34,6 +34,7 @@ tend run -- docker compose up
 tend                            # manage jobs in fzf; ctrl-/ shows the log
 tend ls --json                  # for other tools, e.g. a dashboard
 tend open [name]                # open the URL the job logged in the browser
+tend open [name] --port 5173    # open the job's URL on that port
 tend logs -f | stop | restart | rm [name]
 tend stop -v [name]             # compose jobs: down -v
 tend rename name [new]          # a running job restarts under the new name
