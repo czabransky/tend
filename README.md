@@ -77,6 +77,11 @@ and either way it raises a macOS notification. A small `sh` supervisor in front 
 does that: it passes launchd's `SIGTERM` on to the command, keeps the command's exit code, and
 stays quiet when tend itself is stopping the job.
 
+A job whose process is up shows as starting until it's ready. A command job is ready once it
+listens on a TCP port. One that listened on a port last time stays starting until it does again;
+otherwise it counts as running after 30 seconds without one. A compose job is ready once it has
+containers and none of them is starting or restarting.
+
 Logs are cut to their last 2 MB once they pass 10 MB. Before a start, tend warns when a port the
 job listened on last time is held by another process, and names it.
 

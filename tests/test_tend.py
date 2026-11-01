@@ -568,6 +568,52 @@ class PreviewRefreshTest(TendTest):
             self.assertEqual(tend.refresh_actions("web"), [])
 
 
+class StartingTest(TendTest):
+    def setUp(self):
+        super().setUp()
+        self.job_status.return_value = (42, None)
+
+    def state(self, name, ports=(), started=None, containers=None):
+        with mock.patch.object(tend, "ports", return_value=list(ports)), mock.patch.object(
+            tend, "started", return_value=started
+        ), mock.patch.object(tend, "compose_containers", return_value=containers or {}):
+            return next(tend.jobs(only=name))["state"]
+
+    def test_command_job_is_starting_until_it_listens(self):
+        add_job("web", "npm run dev")
+        self.assertEqual(self.state("web", started=time.time() - 2), "starting")
+        self.assertEqual(self.state("web", ports=[5173], started=time.time() - 2), "running")
+
+    def test_command_job_that_never_listens_is_running_after_the_grace(self):
+        add_job("worker", "npm run worker")
+        self.assertEqual(self.state("worker", started=time.time() - tend.START_GRACE - 1), "running")
+
+    def test_command_job_is_starting_while_its_remembered_port_is_closed(self):
+        add_job("web", "npm run dev")
+        tend.remember_ports("web", [5173])
+        self.assertEqual(self.state("web", started=time.time() - 600), "starting")
+
+    def test_compose_job_is_starting_until_its_containers_are(self):
+        add_job("db", "docker compose up", "/work/app")
+        self.assertEqual(self.state("db"), "starting")
+        starting = {"/work/app": [container("db", "Up 1 second (health: starting)")]}
+        self.assertEqual(self.state("db", containers=starting), "starting")
+        healthy = {"/work/app": [container("db", "Up 9 seconds (healthy)")]}
+        self.assertEqual(self.state("db", containers=healthy), "running")
+
+    def test_fast_list_doesnt_guess(self):
+        add_job("web", "npm run dev")
+        with mock.patch.object(tend, "started", return_value=time.time()):
+            self.assertEqual(next(tend.jobs(fast=True))["state"], "running")
+
+    def test_table_row(self):
+        job = {**TableTest.JOB, "state": "starting", "ports": []}
+        with mock.patch.object(tend, "jobs", return_value=[job]):
+            _, row = [[cell.strip() for cell in line.split("\t")] for line in tend.table(fzf=True)]
+            self.assertEqual(len(tend.table(color=True)), 2)
+        self.assertEqual(row[:3], ["◐", "pf-api", "starting…"])
+
+
 class FastListTest(TendTest):
     def test_uses_remembered_ports_without_lsof(self):
         add_job("web", "npm run dev")

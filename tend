@@ -93,6 +93,9 @@ COMPOSE_READY_TIMEOUT = 300
 # A log past LOG_LIMIT bytes is cut down to its last LOG_KEEP bytes.
 LOG_LIMIT = 10 * 1024 * 1024
 LOG_KEEP = 2 * 1024 * 1024
+# A running job that hasn't listened on a port yet counts as starting for this many seconds after
+# its process starts, or for as long as it isn't listening on a port it used last time.
+START_GRACE = 30
 # A keep-alive job that crashes is started again after this many seconds.
 KEEP_ALIVE_THROTTLE = 5
 # A published port or range in `docker ps` output, e.g. "0.0.0.0:7880-7881->7880-7881/tcp".
@@ -119,7 +122,7 @@ ANSI_COLORS = {
     "text": "39", "subtext": "39", "dim": "90", "surface": "100", "border": "90",
     "green": "32", "red": "31", "blue": "34", "teal": "36", "mauve": "35", "yellow": "33",
 }
-STATE_COLORS = {"running": "green", "exited": "red", "stopped": "dim", "busy": "yellow"}
+STATE_COLORS = {"running": "green", "exited": "red", "stopped": "dim", "busy": "yellow", "starting": "yellow"}
 COLUMN_COLORS = {"name": "text", "ports": "teal", "dir": "dim"}
 FZF_COLORS = ",".join(
     f"{part}:#{PALETTE[color]}"
@@ -455,14 +458,17 @@ def jobs(only=None, fast=False):
             udp = sorted({port for service in services for port in service["udp_ports"]})
         elif running:
             listening = ports(pid)
+        start = started(pid) if running else None
+        state = "running" if running else "stopped" if pid is None else "exited"
+        if running and not fast and starting(path.stem, compose, start, listening, services):
+            state = "starting"
         if (listening or udp or services) and not fast:
             remember_ports(path.stem, listening, udp, services)
         trim_log(path.stem)
-        start = started(pid) if running else None
         yield {
             "name": path.stem,
             "kind": "compose" if compose else "command",
-            "state": "running" if running else "stopped" if pid is None else "exited",
+            "state": state,
             "pid": pid if running else None,
             "exit_code": code,
             "started": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(start)) if start else None,
@@ -476,6 +482,18 @@ def jobs(only=None, fast=False):
             "log": str(log_path(path.stem)),
             "busy": busy_path(path.stem).read_text() if busy_path(path.stem).exists() else None,
         }
+
+
+def starting(name, compose, start, listening, services):
+    """Whether a running job is still coming up. A compose job is starting until it has containers
+    and none of them is starting or restarting. Any other job is starting until it listens on a
+    port, if it listened on one last time or its process started under START_GRACE seconds ago."""
+    if compose:
+        return not services or any(s["status"] in ("starting", "restarting") for s in services)
+    if listening:
+        return False
+    young = start is not None and time.time() - start < START_GRACE
+    return young or bool(remembered_ports(name))
 
 
 def theme():
@@ -506,7 +524,9 @@ def table(color=False, fzf=False, fast=False):
               "command": "COMMAND", "job": "", "service": ""}
     rows = [header]
     for job in jobs(fast=fast):
-        status = {"running": f"up since {job['since']}", "exited": f"exited {job['exit_code']}"}.get(job["state"], "stopped")
+        status = {
+            "running": f"up since {job['since']}", "starting": "starting…", "exited": f"exited {job['exit_code']}"
+        }.get(job["state"], "stopped")
         services = job["services"]
         directory = job["dir"].replace(str(Path.home()), "~", 1)
         rows.append(
@@ -547,7 +567,7 @@ def table(color=False, fzf=False, fast=False):
         cells = []
         for c in columns:
             if c == "state":
-                text = "●" if row["kind"] == "job" and row["state"] != "busy" else "◐" if row["kind"] == "job" else " "
+                text = "●" if row["kind"] == "job" and row["state"] not in ("busy", "starting") else "◐" if row["kind"] == "job" else " "
             elif c == "dir" and row["kind"] == "service" and not fzf:
                 # fzf keeps it for the preview label; the plain table shows it once, on the job.
                 text = ""
